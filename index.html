@@ -432,8 +432,8 @@ document.addEventListener('touchstart', function iosUnlock() {
       <div class="card card-sm" style="background:var(--bg2)">
         <div class="label" style="margin-bottom:6px">Storage</div>
         <div style="font-family:var(--mono);font-size:11px;color:var(--text2);line-height:1.8">
-          All data synced to Supabase cloud ☁<br>
-          Local: ~300 MB per night · clips ~200 KB each<br>
+          All data stays on your phone.<br>
+          ~300 MB per full night · clips ~200 KB each<br>
           <span id="storage-info" style="color:var(--text3)">Calculating…</span>
         </div>
         <button onclick="clearOldData()" style="margin-top:10px;font-family:var(--mono);font-size:10px;padding:8px 14px;border-radius:8px;background:transparent;border:0.5px solid var(--border2);color:var(--text3);cursor:pointer;letter-spacing:0.06em;text-transform:uppercase">
@@ -442,7 +442,7 @@ document.addEventListener('touchstart', function iosUnlock() {
       </div>
 
       <div style="font-family:var(--mono);font-size:10px;color:var(--text3);text-align:center;padding:16px 0;line-height:2">
-        BruxTrack Phase 1 · v0.2.0 · Supabase sync enabled<br>
+        BruxTrack Phase 1 · v0.1.0<br>
         All processing on-device · no cloud · no tracking
       </div>
 
@@ -468,107 +468,7 @@ document.addEventListener('touchstart', function iosUnlock() {
 </div>
 <div id="toast"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
-// ── SUPABASE ─────────────────────────────────────────────────────────────────
-const SUPA_URL = 'https://ukoswihzqpztfypqhdnc.supabase.co';
-const SUPA_KEY = 'sb_publishable_VTSRe2BT1ppguJKRhwQF3A_xr0rUtBt';
-const supa = supabase.createClient(SUPA_URL, SUPA_KEY);
-
-async function syncNightToCloud(night) {
-  try {
-    setSyncStatus('syncing');
-    const { error: ne } = await supa.from('nights').upsert({
-      date: night.date,
-      duration_sec: night.duration,
-      event_count: night.eventCount,
-      confirmed_count: night.confirmedCount || 0,
-      rejected_count: (night.events||[]).filter(e=>e.label==='no').length,
-      confirmation_ratio: night.eventCount > 0 ? (night.confirmedCount||0) / night.eventCount : 0,
-    }, { onConflict: 'date' });
-    if (ne) { setSyncStatus('error'); console.warn('Night sync error:', ne); return false; }
-
-    const { data: nightRow } = await supa.from('nights').select('id').eq('date', night.date).single();
-    if (!nightRow) { setSyncStatus('error'); return false; }
-    const nightId = nightRow.id;
-
-    const eventRows = (night.events||[]).map(ev => ({
-      id: String(ev.id), night_id: nightId,
-      wall_time: ev.wallTime || ev.timeLabel, timestamp_sec: ev.timestamp,
-      duration_sec: ev.duration, peak_hz: ev.peakHz, amplitude: ev.amplitude,
-      db_level: ev.dB, bruxism_score_raw: ev.bruxismScore,
-      label: ev.label || 'unconfirmed', has_clip: ev.hasClip || false,
-    }));
-    if (eventRows.length > 0) {
-      const { error: ee } = await supa.from('events').upsert(eventRows, { onConflict: 'id' });
-      if (ee) console.warn('Events sync error:', ee);
-    }
-
-    for (const ev of (night.events||[])) {
-      if (!ev.hasClip) continue;
-      try {
-        const clipRecord = await dbGet('clips', ev.id);
-        if (!clipRecord?.blob) continue;
-        const path = `${night.date}/${ev.id}.webm`;
-        const { error: se } = await supa.storage.from('audio-clips').upload(path, clipRecord.blob, {
-          contentType: clipRecord.mime || 'audio/webm', upsert: true
-        });
-        if (!se) await supa.from('events').update({ clip_path: path, has_clip: true }).eq('id', String(ev.id));
-      } catch(e) { console.warn('Clip upload error', ev.id, e); }
-    }
-    setSyncStatus('synced');
-    return true;
-  } catch(e) { setSyncStatus('error'); console.warn('syncNightToCloud failed:', e); return false; }
-}
-
-async function syncLabelToCloud(eventId, label) {
-  try { await supa.from('events').update({ label }).eq('id', String(eventId)); }
-  catch(e) { console.warn('Label sync error:', e); }
-}
-
-async function loadLastNightFromCloud(dateStr) {
-  try {
-    const { data: night } = await supa.from('nights').select('*').eq('date', dateStr).single();
-    if (!night) return null;
-    const { data: events } = await supa.from('events').select('*').eq('night_id', night.id);
-    return {
-      date: night.date, duration: night.duration_sec,
-      eventCount: night.event_count, confirmedCount: night.confirmed_count,
-      events: (events||[]).map(e => ({
-        id: e.id, wallTime: e.wall_time, timeLabel: e.wall_time,
-        timestamp: e.timestamp_sec, duration: e.duration_sec, peakHz: e.peak_hz,
-        amplitude: e.amplitude, dB: e.db_level, bruxismScore: e.bruxism_score_raw,
-        label: e.label, hasClip: e.has_clip, clipPath: e.clip_path,
-      }))
-    };
-  } catch(e) { return null; }
-}
-
-async function getClipFromCloud(clipPath) {
-  try { const { data } = await supa.storage.from('audio-clips').download(clipPath); return data; }
-  catch(e) { return null; }
-}
-
-function setSyncStatus(status) {
-  let badge = document.getElementById('sync-badge');
-  if (!badge) {
-    badge = document.createElement('span');
-    badge.id = 'sync-badge';
-    badge.style.cssText = 'font-family:var(--mono);font-size:8px;letter-spacing:0.07em;text-transform:uppercase;padding:3px 7px;border-radius:20px;margin-left:6px;transition:all 0.3s;vertical-align:middle';
-    const titleEl = document.querySelector('#topbar .app-title');
-    if (titleEl) titleEl.insertAdjacentElement('afterend', badge);
-  }
-  const map = {
-    syncing: ['☁ syncing…','#f3f0ff','#7c3aed'],
-    synced:  ['✓ synced',  '#ecfdf5','#059669'],
-    error:   ['⚠ offline', '#fef2f2','#dc2626'],
-    offline: ['● local',   '#f8f7ff','#9895b0'],
-  };
-  const [txt,bg,col] = map[status]||map.offline;
-  badge.textContent=txt; badge.style.background=bg; badge.style.color=col;
-}
-// ── END SUPABASE ─────────────────────────────────────────────────────────────
-
 const state = {
   recording: false, startTime: null, events: [],
   audioCtx: null, analyser: null, mediaStream: null,
@@ -671,10 +571,7 @@ async function stopRecording() {
   const dateStr = todayStr();
   const night = { date:dateStr, duration:Math.round(duration/1000), eventCount:state.events.length, confirmedCount:state.events.filter(e=>e.label==='yes').length, events:state.events };
   await dbPut('nights', night);
-  toast('Recording saved — syncing to cloud…');
-  syncNightToCloud(night).then(ok => {
-    toast(ok ? '✓ Synced to cloud!' : 'Saved locally — sync when online');
-  });
+  toast('Recording saved — check your report!');
   showScreen('events', document.querySelectorAll('.nav-btn')[1]);
 }
 
@@ -692,26 +589,28 @@ function analyzeLoop() {
   let rms=0; for(let i=0;i<state.waveformData.length;i++) rms+=state.waveformData[i]**2;
   rms=Math.sqrt(rms/state.waveformData.length);
   const dB = rms>0?Math.round(20*Math.log10(rms)):-100;
-    // ── FIXED DETECTION v2 ──────────────────────────────────────
-  // Peak bin in bruxism range (250–3500 Hz) — far more sensitive than mean
+    // ── DETECTION v3 ──────────────────────────────────────────────
+  // Peak energy strictly inside bruxism band (250–3500 Hz)
   const l250=Math.floor(250/bin), h3500=Math.ceil(3500/bin);
   let peakBrux=0;
   for(let i=l250;i<=h3500&&i<state.freqData.length;i++){
     if(state.freqData[i]>peakBrux) peakBrux=state.freqData[i];
   }
-  // Map slider 20–95 → peak-bin threshold 10–50 (correct units)
-  // At default 55: thresh≈29. Real grinding peak: 30–80. Silent room: 5–15.
+  // Map slider 20–95 → threshold 12–55
   const sens=state.settings.sensitivity;
-  const thresh=Math.round(10+((sens-20)/75)*40);
+  const thresh=Math.round(12+((sens-20)/75)*43);
   let cand=peakBrux>thresh;
-  // Snore filter: low-freq energy dominates over bruxism peak
-  if(state.settings.filterSnore&&snoreBand>peakBrux*0.8&&snoreBand>20) cand=false;
-  // Speech filter: strong upper presence above mid band
-  if(state.settings.filterSpeech&&presence>midBand*1.2&&presence>35) cand=false;
-  // Impact filter REMOVED — bruxism is broadband, filter was killing valid events
-  const ONSET=3, OFFSET=10, MIN=4;
+  // FILTER 1 — peak Hz must be in bruxism range (rejects speech at 80–200 Hz)
+  if(peakHz < 200) cand=false;
+  // FILTER 2 — snore: low-freq dominates
+  if(state.settings.filterSnore&&snoreBand>peakBrux*0.75&&snoreBand>18) cand=false;
+  // FILTER 3 — speech: strong formant structure (presence tracks mid band closely)
+  if(state.settings.filterSpeech&&presence>midBand*1.1&&presence>30) cand=false;
+  // ONSET=5 frames (~0.33s), OFFSET=15 frames (~1s), MIN=8 frames (~0.5s) before registering
+  // This means event must sustain ~0.33s to start, and be at least ~0.5s long
+  const ONSET=5, OFFSET=15, MIN=8;
   if(cand) { state.eventFrames++; state.silenceFrames=0; if(!state.inEvent&&state.eventFrames>=ONSET){state.inEvent=true;state.eventStart=Date.now();} }
-  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN)registerEvent(dur,peakHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
+  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN && dur>=1.0)registerEvent(dur,peakHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
   const _d=document.getElementById('stat-debug');if(_d)_d.textContent='peak='+peakBrux+' thr='+thresh+(cand?' ✓':'');
   document.getElementById('stat-db').textContent = dB>-80?dB+' dB':'—';
   document.getElementById('stat-freq').textContent = peakHz>50?peakHz+' Hz':'—';
@@ -799,14 +698,7 @@ async function renderEventsScreen() {
   const dateStr=todayStr();
   document.getElementById('report-date').textContent='Last night · '+new Date().toLocaleDateString('en',{weekday:'long',month:'long',day:'numeric'});
   let events=[...state.events];
-  if(!state.recording&&events.length===0){
-    try{const n=await dbGet('nights',dateStr);if(n)events=n.events||[];}catch(e){}
-    // Fallback: load from Supabase if still empty
-    if(events.length===0){
-      const cloudNight = await loadLastNightFromCloud(dateStr);
-      if(cloudNight) events = cloudNight.events||[];
-    }
-  }
+  if(!state.recording&&events.length===0){try{const n=await dbGet('nights',dateStr);if(n)events=n.events||[];}catch(e){}}
   const list=document.getElementById('events-list');
   if(!events.length){list.innerHTML=`<div class="empty"><div class="empty-icon">◎</div><div class="empty-text">No events detected yet.<br>Start a recording session first.</div></div>`;document.getElementById('report-card').style.display='none';document.getElementById('summary-stats').style.display='none';return;}
   const confirmed=events.filter(e=>e.label==='yes').length, rejected=events.filter(e=>e.label==='no').length, total=events.length;
@@ -820,7 +712,7 @@ async function renderEventsScreen() {
   const night=await dbGet('nights',dateStr).catch(()=>null);
   const dur=night?night.duration:(state.startTime?Math.floor((Date.now()-state.startTime)/60000):0);
   document.getElementById('sum-duration').textContent=dur>3600?Math.floor(dur/3600)+'h '+Math.floor((dur%3600)/60)+'m':Math.floor(dur/60)+' min';
-  list.innerHTML=events.map(ev=>`<div class="event-item" data-clip-path="${ev.clipPath||''}"><div class="event-icon" style="background:var(--accentlt)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div><div class="event-info"><div class="event-time">${ev.wallTime||ev.timeLabel} · ${ev.duration}s</div><div class="event-desc">${ev.peakHz} Hz · ${ev.dB} dB · raw score ${ev.bruxismScore}</div><div class="event-tags">${lbadge(ev.label)}<span class="tag" style="background:var(--hotlt);color:var(--hot)">${ev.duration>15?'long':ev.duration>5?'medium':'short'}</span><span class="tag" style="background:var(--accentlt);color:var(--accent2)">${ev.peakHz<500?'low-freq':ev.peakHz<2000?'mid-freq':'hi-freq'}</span></div><div class="confirm-row">${(ev.hasClip)?`<button class="cfm-btn" style="border-color:#c4b5fd;color:var(--accent2);flex:0 0 auto;padding:7px 10px" onclick="playClip('${ev.id}',this)"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><path d="M5 3l14 9-14 9V3z"/></svg>Play</button>`:'<span style="font-family:var(--mono);font-size:8px;color:var(--text3);align-self:center;flex:0 0 auto">no clip</span>'}<button class="cfm-btn cfm-yes ${ev.label==='yes'?'selected':''}" onclick="confirmEvent('${ev.id}','yes')">Bruxism</button><button class="cfm-btn cfm-no ${ev.label==='no'?'selected':''}" onclick="confirmEvent('${ev.id}','no')">Not bruxism</button><button class="cfm-btn cfm-maybe ${ev.label==='maybe'?'selected':''}" onclick="confirmEvent('${ev.id}','maybe')">Unsure</button></div></div></div>`).join('');
+  list.innerHTML=events.map(ev=>`<div class="event-item"><div class="event-icon" style="background:var(--accentlt)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div><div class="event-info"><div class="event-time">${ev.wallTime||ev.timeLabel} · ${ev.duration}s</div><div class="event-desc">${ev.peakHz} Hz · ${ev.dB} dB · raw score ${ev.bruxismScore}</div><div class="event-tags">${lbadge(ev.label)}<span class="tag" style="background:var(--hotlt);color:var(--hot)">${ev.duration>15?'long':ev.duration>5?'medium':'short'}</span><span class="tag" style="background:var(--accentlt);color:var(--accent2)">${ev.peakHz<500?'low-freq':ev.peakHz<2000?'mid-freq':'hi-freq'}</span></div><div class="confirm-row">${(ev.hasClip)?`<button class="cfm-btn" style="border-color:#c4b5fd;color:var(--accent2);flex:0 0 auto;padding:7px 10px" onclick="playClip('${ev.id}',this)"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><path d="M5 3l14 9-14 9V3z"/></svg>Play</button>`:'<span style="font-family:var(--mono);font-size:8px;color:var(--text3);align-self:center;flex:0 0 auto">no clip</span>'}<button class="cfm-btn cfm-yes ${ev.label==='yes'?'selected':''}" onclick="confirmEvent('${ev.id}','yes')">Bruxism</button><button class="cfm-btn cfm-no ${ev.label==='no'?'selected':''}" onclick="confirmEvent('${ev.id}','no')">Not bruxism</button><button class="cfm-btn cfm-maybe ${ev.label==='maybe'?'selected':''}" onclick="confirmEvent('${ev.id}','maybe')">Unsure</button></div></div></div>`).join('');
 }
 
 function lbadge(l){if(l==='yes')return`<span class="tag" style="background:var(--greenlt);color:var(--green)">confirmed</span>`;if(l==='no')return`<span class="tag" style="background:var(--redlt);color:var(--red)">rejected</span>`;if(l==='maybe')return`<span class="tag" style="background:var(--amberlt);color:var(--amber)">unsure</span>`;return`<span class="tag" style="background:var(--bg3);color:var(--text3)">unconfirmed</span>`;}
@@ -838,21 +730,9 @@ async function playClip(eventId, btn) {
     if (btn.dataset.playing === '1') { btn.dataset.playing = '0'; return; }
   }
   try {
-    let blob = null;
-    const record = await dbGet('clips', parseInt(eventId)).catch(()=>null);
-    if (record?.blob) {
-      blob = record.blob;
-    } else {
-      // Try cloud — find clip_path from rendered events
-      const evEl = btn.closest('.event-item');
-      const clipPath = evEl?.dataset?.clipPath;
-      if (clipPath) {
-        toast('Loading clip from cloud…');
-        blob = await getClipFromCloud(clipPath);
-      }
-    }
-    if (!blob) { toast('No audio clip saved for this event'); return; }
-    const url = URL.createObjectURL(blob);
+    const record = await dbGet('clips', parseInt(eventId));
+    if (!record || !record.blob) { toast('No audio clip saved for this event'); return; }
+    const url = URL.createObjectURL(record.blob);
     const audio = new Audio(url);
     _currentAudio = audio;
     btn.classList.add('clip-playing');
@@ -872,7 +752,6 @@ async function playClip(eventId, btn) {
 async function confirmEvent(id,label){
   const ev=state.events.find(e=>String(e.id)===String(id));if(ev)ev.label=label;
   try{const ds=todayStr();const n=await dbGet('nights',ds);if(n){const de=(n.events||[]).find(e=>String(e.id)===String(id));if(de){de.label=label;await dbPut('nights',n);}}}catch(e){}
-  syncLabelToCloud(id, label); // fire-and-forget to Supabase
   renderEventsScreen();
 }
 
