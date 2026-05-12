@@ -304,6 +304,7 @@ document.addEventListener('touchstart', function iosUnlock() {
       <div class="app-sub">sign in to sync your data</div>
     </div>
     <p class="auth-desc">Enter your email to receive a sign-in link.<br>One-time setup — stays signed in forever.</p>
+    <div id="auth-debug" style="font-size:9px;color:var(--text3);word-break:break-all;display:none"></div>
     <input type="email" id="auth-email" placeholder="your@email.com" autocomplete="email">
     <button id="auth-btn" onclick="sendMagicLink()">Send sign-in link</button>
     <div id="auth-msg"></div>
@@ -879,11 +880,21 @@ function initSupabase() {
       msg.textContent = 'SDK not loaded — check connection';
       return;
     }
+    // Debug: show URL hash/search to diagnose auth redirect
+    const dbg = document.getElementById('auth-debug');
+    const hashStr = window.location.hash.slice(0,120);
+    const srchStr = window.location.search.slice(0,120);
+    if (hashStr || srchStr) {
+      dbg.style.display = 'block';
+      dbg.textContent = 'hash: ' + (hashStr||'—') + ' | search: ' + (srchStr||'—');
+    }
+
     supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
       auth: { flowType: 'implicit', detectSessionInUrl: true, persistSession: true }
     });
-    supabase.auth.onAuthStateChange((_event, session) => {
+    supabase.auth.onAuthStateChange((event, session) => {
       state.user = session?.user ?? null;
+      if (dbg) dbg.textContent += ' | event: ' + event + (session ? ' ✓' : ' ✗');
       document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
     });
     supabase.auth.getSession().then(({ data: { session } }) => {
