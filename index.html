@@ -291,6 +291,24 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px;
   box-shadow: 0 2px 8px rgba(0,0,0,0.07);
   align-items: center; gap: 5px;
 }
+#sync-error-banner {
+  display: none;
+  position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+  padding: 14px 18px;
+  padding-top: max(14px, env(safe-area-inset-top));
+  background: var(--red); color: #fff;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  word-break: break-word;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+}
+#sync-error-banner.show { display: block; }
+#sync-error-banner .title { font-weight: 700; margin-bottom: 4px; }
+#sync-error-banner .close {
+  position: absolute; top: 10px; right: 12px;
+  padding-top: max(10px, env(safe-area-inset-top));
+  background: none; border: none; color: #fff;
+  font-size: 20px; cursor: pointer; line-height: 1;
+}
 #sync-badge.show    { display: flex; background: var(--bg);      color: var(--text2); }
 #sync-badge.syncing { display: flex; background: var(--amberlt); color: var(--amber); border-color: var(--amberbd); }
 #sync-badge.synced  { display: flex; background: var(--greenlt); color: var(--green); border-color: var(--greenbd); }
@@ -545,6 +563,11 @@ document.addEventListener('touchstart', function iosUnlock() {
 </div>
 <div id="toast"></div>
 <div id="sync-badge"></div>
+<div id="sync-error-banner">
+  <button class="close" onclick="document.getElementById('sync-error-banner').classList.remove('show')">×</button>
+  <div class="title">Sync failed</div>
+  <div id="sync-error-text"></div>
+</div>
 
 <script>
 const SUPABASE_URL = 'https://ukoswihzqpztfypqhdnc.supabase.co';
@@ -955,10 +978,21 @@ function updateSyncStatus(status, errMsg) {
   state.syncStatus = status;
   state.lastSyncError = errMsg || null;
   const badge = document.getElementById('sync-badge');
+  const banner = document.getElementById('sync-error-banner');
   badge.className = status;
-  if (status === 'syncing') badge.textContent = '⏳ syncing…';
-  else if (status === 'synced') { badge.textContent = '✓ synced'; setTimeout(() => { badge.className = ''; }, 4000); }
-  else if (status === 'error')  { badge.textContent = '✗ sync failed — tap'; badge.style.cursor = 'pointer'; badge.onclick = () => toast(state.lastSyncError || 'Unknown sync error', 8000); }
+  if (status === 'syncing') {
+    badge.textContent = '⏳ syncing…';
+    banner.classList.remove('show');
+  } else if (status === 'synced') {
+    badge.textContent = '✓ synced';
+    banner.classList.remove('show');
+    setTimeout(() => { badge.className = ''; }, 4000);
+  } else if (status === 'error') {
+    badge.textContent = '✗ sync failed';
+    // Show full error in persistent banner so it's impossible to miss on mobile
+    document.getElementById('sync-error-text').textContent = errMsg || 'Unknown error';
+    banner.classList.add('show');
+  }
 }
 
 // ── CLOUD SYNC ─────────────────────────────────────────────────────────────
@@ -1024,8 +1058,16 @@ async function syncNightToCloud(night) {
     updateSyncStatus('synced');
   } catch(e) {
     console.error('syncNightToCloud failed', e);
-    const detail = e?.message || e?.error_description || (typeof e === 'string' ? e : JSON.stringify(e).slice(0,300));
-    updateSyncStatus('error', detail);
+    // Pull as much detail as possible from Supabase errors
+    const parts = [];
+    if (e?.message) parts.push(e.message);
+    if (e?.code) parts.push('code=' + e.code);
+    if (e?.details) parts.push('details=' + e.details);
+    if (e?.hint) parts.push('hint=' + e.hint);
+    if (e?.error_description) parts.push(e.error_description);
+    if (parts.length === 0) parts.push(typeof e === 'string' ? e : JSON.stringify(e).slice(0,400));
+    if (state.user) parts.push('user=' + state.user.id.slice(0,8));
+    updateSyncStatus('error', parts.join(' | '));
   }
 }
 
