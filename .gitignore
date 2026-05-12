@@ -1,0 +1,51 @@
+# --- Patent & IP (CRITICAL — never commit) ---
+*.docx
+*.pdf
+**/patent/**
+**/disclosure/**
+**/Disclosure*
+**/BSI_EBI_*
+**/*Roadmap*.docx
+**/*Roadmap*.pdf
+
+# --- Secrets ---
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets.json
+supabase/.env
+
+# --- Local data (audio clips, exports, test data) ---
+test/clips/
+test/*.webm
+test/*.wav
+test/*.mp3
+exports/
+*.csv
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Build / cache (we don't have a build step now, but in case we add one) ---
+node_modules/
+dist/
+build/
+.cache/
+.parcel-cache/
+
+# --- Logs ---
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# --- Accidental clone-in-clone (if it happened) ---
+BruxAI/
