@@ -877,7 +877,9 @@ function initSupabase() {
       msg.textContent = 'SDK not loaded — check connection';
       return;
     }
-    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+      auth: { flowType: 'implicit', detectSessionInUrl: true, persistSession: true }
+    });
     supabase.auth.onAuthStateChange((_event, session) => {
       state.user = session?.user ?? null;
       document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
