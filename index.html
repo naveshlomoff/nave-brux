@@ -303,11 +303,19 @@ document.addEventListener('touchstart', function iosUnlock() {
       <div class="app-title">BruxTrack</div>
       <div class="app-sub">sign in to sync your data</div>
     </div>
-    <p class="auth-desc">Enter your email to receive a sign-in link.<br>One-time setup — stays signed in forever.</p>
-    <div id="auth-debug" style="font-size:9px;color:var(--text3);word-break:break-all;display:none"></div>
-    <input type="email" id="auth-email" placeholder="your@email.com" autocomplete="email">
-    <button id="auth-btn" onclick="sendMagicLink()">Send sign-in link</button>
+    <div id="auth-step-email">
+      <p class="auth-desc">Enter your email — we'll send a 6-digit code.<br>One-time setup, stays signed in forever.</p>
+      <input type="email" id="auth-email" placeholder="your@email.com" autocomplete="email" inputmode="email">
+      <button id="auth-send-btn" onclick="sendOtpCode()">Send code</button>
+    </div>
+    <div id="auth-step-code" style="display:none">
+      <p class="auth-desc">Check your email for a 6-digit code.<br><b id="auth-email-display" style="color:var(--text)"></b></p>
+      <input type="text" id="auth-code" placeholder="123456" maxlength="6" inputmode="numeric" autocomplete="one-time-code" style="text-align:center;letter-spacing:0.4em;font-size:18px">
+      <button id="auth-verify-btn" onclick="verifyOtpCode()">Verify & sign in</button>
+      <button id="auth-reset-btn" onclick="resetAuth()" style="background:none;color:var(--text2);font-weight:400;padding:8px">Use different email</button>
+    </div>
     <div id="auth-msg"></div>
+    <div id="auth-debug" style="font-size:9px;color:var(--text3);word-break:break-all;display:none"></div>
   </div>
 </div>
 
@@ -872,6 +880,8 @@ function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t
 
 // ── SUPABASE AUTH ──────────────────────────────────────────────────────────
 
+let _pendingEmail = null;
+
 function initSupabase() {
   const msg = document.getElementById('auth-msg');
   try {
@@ -880,34 +890,29 @@ function initSupabase() {
       msg.textContent = 'SDK not loaded — check connection';
       return;
     }
-    // Debug: show URL hash/search to diagnose auth redirect
-    const dbg = document.getElementById('auth-debug');
-    const hashStr = window.location.hash.slice(0,120);
-    const srchStr = window.location.search.slice(0,120);
-    if (hashStr || srchStr) {
-      dbg.style.display = 'block';
-      dbg.textContent = 'hash: ' + (hashStr||'—') + ' | search: ' + (srchStr||'—');
+    // Clean up any leftover error fragments from old magic-link attempts
+    if (window.location.hash.includes('error=') || window.location.hash.includes('access_token=')) {
+      history.replaceState(null, '', window.location.pathname);
     }
 
     supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth: { flowType: 'implicit', detectSessionInUrl: true, persistSession: true }
+      auth: { flowType: 'implicit', detectSessionInUrl: false, persistSession: true }
     });
-    supabase.auth.onAuthStateChange((event, session) => {
+    supabase.auth.onAuthStateChange((_event, session) => {
       state.user = session?.user ?? null;
-      if (dbg) dbg.textContent += ' | event: ' + event + (session ? ' ✓' : ' ✗');
       document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
     });
     supabase.auth.getSession().then(({ data: { session } }) => {
       state.user = session?.user ?? null;
       if (state.user) document.getElementById('auth-overlay').classList.add('hidden');
-    }).catch(e => { msg.className = 'error'; msg.textContent = 'getSession error: ' + e.message; });
+    }).catch(e => { msg.className = 'error'; msg.textContent = 'getSession: ' + e.message; });
   } catch(e) {
     msg.className = 'error';
     msg.textContent = 'Init error: ' + e.message;
   }
 }
 
-async function sendMagicLink() {
+async function sendOtpCode() {
   if (!supabase) {
     document.getElementById('auth-msg').className = 'error';
     document.getElementById('auth-msg').textContent = 'Not initialized — reload page';
@@ -915,18 +920,62 @@ async function sendMagicLink() {
   }
   const email = document.getElementById('auth-email').value.trim();
   if (!email) return;
-  const btn = document.getElementById('auth-btn');
+  const btn = document.getElementById('auth-send-btn');
   const msg = document.getElementById('auth-msg');
   btn.disabled = true; btn.textContent = 'Sending…';
+  msg.className = ''; msg.textContent = '';
   try {
-    const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+    const { error } = await supabase.auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: true }
+    });
     if (error) throw error;
-    msg.className = 'success'; msg.textContent = 'Check your email — link sent!';
-    btn.textContent = 'Sent ✓';
+    _pendingEmail = email;
+    document.getElementById('auth-email-display').textContent = email;
+    document.getElementById('auth-step-email').style.display = 'none';
+    document.getElementById('auth-step-code').style.display = 'block';
+    setTimeout(() => document.getElementById('auth-code').focus(), 100);
   } catch(e) {
-    msg.className = 'error'; msg.textContent = e.message || 'Something went wrong';
-    btn.disabled = false; btn.textContent = 'Send sign-in link';
+    msg.className = 'error';
+    msg.textContent = (e.message || '').includes('rate limit')
+      ? 'Too many attempts — wait ~1 hour'
+      : (e.message || 'Failed to send code');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Send code';
   }
+}
+
+async function verifyOtpCode() {
+  if (!supabase || !_pendingEmail) return;
+  const token = document.getElementById('auth-code').value.trim();
+  if (!token) return;
+  const btn = document.getElementById('auth-verify-btn');
+  const msg = document.getElementById('auth-msg');
+  btn.disabled = true; btn.textContent = 'Verifying…';
+  msg.className = ''; msg.textContent = '';
+  try {
+    const { error } = await supabase.auth.verifyOtp({
+      email: _pendingEmail, token, type: 'email'
+    });
+    if (error) throw error;
+    // onAuthStateChange fires SIGNED_IN → overlay hides automatically
+  } catch(e) {
+    msg.className = 'error';
+    msg.textContent = (e.message || '').includes('expired')
+      ? 'Code expired — request a new one'
+      : (e.message || 'Invalid code');
+    btn.disabled = false; btn.textContent = 'Verify & sign in';
+  }
+}
+
+function resetAuth() {
+  _pendingEmail = null;
+  document.getElementById('auth-email').value = '';
+  document.getElementById('auth-code').value = '';
+  document.getElementById('auth-step-email').style.display = 'block';
+  document.getElementById('auth-step-code').style.display = 'none';
+  document.getElementById('auth-msg').className = '';
+  document.getElementById('auth-msg').textContent = '';
 }
 
 // ── SYNC STATUS ────────────────────────────────────────────────────────────
