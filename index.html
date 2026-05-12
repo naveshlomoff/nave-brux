@@ -870,18 +870,34 @@ function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t
 // ── SUPABASE AUTH ──────────────────────────────────────────────────────────
 
 function initSupabase() {
-  supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-  supabase.auth.onAuthStateChange((_event, session) => {
-    state.user = session?.user ?? null;
-    document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
-  });
-  supabase.auth.getSession().then(({ data: { session } }) => {
-    state.user = session?.user ?? null;
-    if (!state.user) document.getElementById('auth-overlay').classList.remove('hidden');
-  });
+  const msg = document.getElementById('auth-msg');
+  try {
+    if (!window.supabase || !window.supabase.createClient) {
+      msg.className = 'error';
+      msg.textContent = 'SDK not loaded — check connection';
+      return;
+    }
+    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    supabase.auth.onAuthStateChange((_event, session) => {
+      state.user = session?.user ?? null;
+      document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
+    });
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      state.user = session?.user ?? null;
+      if (state.user) document.getElementById('auth-overlay').classList.add('hidden');
+    }).catch(e => { msg.className = 'error'; msg.textContent = 'getSession error: ' + e.message; });
+  } catch(e) {
+    msg.className = 'error';
+    msg.textContent = 'Init error: ' + e.message;
+  }
 }
 
 async function sendMagicLink() {
+  if (!supabase) {
+    document.getElementById('auth-msg').className = 'error';
+    document.getElementById('auth-msg').textContent = 'Not initialized — reload page';
+    return;
+  }
   const email = document.getElementById('auth-email').value.trim();
   if (!email) return;
   const btn = document.getElementById('auth-btn');
