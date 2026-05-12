@@ -1032,11 +1032,14 @@ async function uploadClipToCloud(eventId, dateStr, nightId, retries = 2) {
   try {
     const record = await dbGet('clips', parseInt(eventId));
     if (!record?.blob) return;
-    const path = `${state.user.id}/${dateStr}/${eventId}.webm`;
+    // Derive extension from saved mime (mp4 on iOS, webm on Android/desktop)
+    const mime = record.mime || 'audio/webm';
+    const ext = mime.includes('mp4') ? 'mp4' : mime.includes('webm') ? 'webm' : 'bin';
+    const path = `${state.user.id}/${dateStr}/${eventId}.${ext}`;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const { error } = await supabase.storage.from('audio-clips')
-          .upload(path, record.blob, { contentType: record.mime || 'audio/webm', upsert: true });
+          .upload(path, record.blob, { contentType: mime, upsert: true });
         if (error) throw error;
         // Store clip_path back on the event in the cloud
         await supabase.from('events')
