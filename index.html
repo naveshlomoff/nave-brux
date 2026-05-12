@@ -608,7 +608,9 @@ async function startRecording() {
   state.waveformData = new Float32Array(state.analyser.fftSize);
   // Always run MediaRecorder for event clips (rolling 1-second chunks)
   try {
-    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')?'audio/webm;codecs=opus':'audio/webm';
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
+                 MediaRecorder.isTypeSupported('audio/mp4;codecs=mp4a.40.2') ? 'audio/mp4;codecs=mp4a.40.2' :
+                 MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : 'audio/webm';
     state.clipMime = mime;
     state.mediaRecorder = new MediaRecorder(state.mediaStream,{mimeType:mime});
     state.rollingChunks = []; // rolling window: last ~20 s of 1-s slices
