@@ -270,6 +270,17 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px;
 #auth-msg.success { color: var(--green); }
 #auth-msg.error   { color: var(--red); }
 
+/* spinner for anonymous-signin loading */
+.auth-spinner {
+  width: 28px; height: 28px; margin: 8px auto;
+  border: 3px solid var(--bg3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: auth-spin 0.8s linear infinite;
+}
+.auth-spinner.hidden { display: none; }
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+
 /* ── SYNC BADGE ── */
 #sync-badge {
   display: none;
@@ -296,26 +307,17 @@ document.addEventListener('touchstart', function iosUnlock() {
 </head>
 <body>
 
-<!-- ── AUTH OVERLAY ── -->
+<!-- ── AUTH OVERLAY (anonymous auto-signin) ── -->
 <div id="auth-overlay">
   <div id="auth-card">
     <div class="auth-logo">
       <div class="app-title">BruxTrack</div>
-      <div class="app-sub">sign in to sync your data</div>
+      <div class="app-sub">personal bruxism tracker</div>
     </div>
-    <div id="auth-step-email">
-      <p class="auth-desc">Enter your email — we'll send a 6-digit code.<br>One-time setup, stays signed in forever.</p>
-      <input type="email" id="auth-email" placeholder="your@email.com" autocomplete="email" inputmode="email">
-      <button id="auth-send-btn" onclick="sendOtpCode()">Send code</button>
-    </div>
-    <div id="auth-step-code" style="display:none">
-      <p class="auth-desc">Check your email for a 6-digit code.<br><b id="auth-email-display" style="color:var(--text)"></b></p>
-      <input type="text" id="auth-code" placeholder="123456" maxlength="6" inputmode="numeric" autocomplete="one-time-code" style="text-align:center;letter-spacing:0.4em;font-size:18px">
-      <button id="auth-verify-btn" onclick="verifyOtpCode()">Verify & sign in</button>
-      <button id="auth-reset-btn" onclick="resetAuth()" style="background:none;color:var(--text2);font-weight:400;padding:8px">Use different email</button>
-    </div>
+    <p class="auth-desc" id="auth-status-text">Setting up your private account…</p>
+    <div class="auth-spinner"></div>
     <div id="auth-msg"></div>
-    <div id="auth-debug" style="font-size:9px;color:var(--text3);word-break:break-all;display:none"></div>
+    <button id="auth-retry-btn" onclick="signInAnonymous()" style="display:none">Retry</button>
   </div>
 </div>
 
@@ -549,7 +551,7 @@ const SUPABASE_URL = 'https://ukoswihzqpztfypqhdnc.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_VTSRe2BT1ppguJKRhwQF3A_xr0rUtBt';
 let supabase;
 </script>
-<script src="https://unpkg.com/@supabase/supabase-js@2.39.8/dist/umd/supabase.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 const state = {
   recording: false, startTime: null, events: [],
@@ -880,102 +882,71 @@ function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t
 
 // ── SUPABASE AUTH ──────────────────────────────────────────────────────────
 
-let _pendingEmail = null;
-
 function initSupabase() {
   const msg = document.getElementById('auth-msg');
   try {
     if (!window.supabase || !window.supabase.createClient) {
       msg.className = 'error';
       msg.textContent = 'SDK not loaded — check connection';
+      document.querySelector('.auth-spinner').classList.add('hidden');
       return;
     }
-    // Clean up any leftover error fragments from old magic-link attempts
+    // Clean up stale URL fragments from past magic-link attempts
     if (window.location.hash.includes('error=') || window.location.hash.includes('access_token=')) {
       history.replaceState(null, '', window.location.pathname);
     }
 
     supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth: { flowType: 'implicit', detectSessionInUrl: false, persistSession: true }
+      auth: { detectSessionInUrl: false, persistSession: true, autoRefreshToken: true }
     });
     supabase.auth.onAuthStateChange((_event, session) => {
       state.user = session?.user ?? null;
       document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
     });
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      state.user = session?.user ?? null;
-      if (state.user) document.getElementById('auth-overlay').classList.add('hidden');
-    }).catch(e => { msg.className = 'error'; msg.textContent = 'getSession: ' + e.message; });
+    // Resume existing session, or auto-create an anonymous one
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session?.user) {
+        state.user = session.user;
+        document.getElementById('auth-overlay').classList.add('hidden');
+        return;
+      }
+      await signInAnonymous();
+    }).catch(e => {
+      msg.className = 'error';
+      msg.textContent = 'Auth error: ' + e.message;
+      document.querySelector('.auth-spinner').classList.add('hidden');
+    });
   } catch(e) {
     msg.className = 'error';
     msg.textContent = 'Init error: ' + e.message;
+    document.querySelector('.auth-spinner').classList.add('hidden');
   }
 }
 
-async function sendOtpCode() {
-  if (!supabase) {
-    document.getElementById('auth-msg').className = 'error';
-    document.getElementById('auth-msg').textContent = 'Not initialized — reload page';
-    return;
-  }
-  const email = document.getElementById('auth-email').value.trim();
-  if (!email) return;
-  const btn = document.getElementById('auth-send-btn');
+async function signInAnonymous() {
   const msg = document.getElementById('auth-msg');
-  btn.disabled = true; btn.textContent = 'Sending…';
+  const status = document.getElementById('auth-status-text');
+  const spinner = document.querySelector('.auth-spinner');
+  const retry = document.getElementById('auth-retry-btn');
   msg.className = ''; msg.textContent = '';
+  status.textContent = 'Creating your private account…';
+  spinner.classList.remove('hidden');
+  retry.style.display = 'none';
   try {
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { shouldCreateUser: true }
-    });
+    const { data, error } = await supabase.auth.signInAnonymously();
     if (error) throw error;
-    _pendingEmail = email;
-    document.getElementById('auth-email-display').textContent = email;
-    document.getElementById('auth-step-email').style.display = 'none';
-    document.getElementById('auth-step-code').style.display = 'block';
-    setTimeout(() => document.getElementById('auth-code').focus(), 100);
+    // onAuthStateChange will fire SIGNED_IN and hide the overlay
   } catch(e) {
+    spinner.classList.add('hidden');
     msg.className = 'error';
-    msg.textContent = (e.message || '').includes('rate limit')
-      ? 'Too many attempts — wait ~1 hour'
-      : (e.message || 'Failed to send code');
-  } finally {
-    btn.disabled = false; btn.textContent = 'Send code';
+    const m = e.message || '';
+    if (m.toLowerCase().includes('anonymous') && (m.toLowerCase().includes('disabled') || m.toLowerCase().includes('not enabled'))) {
+      msg.innerHTML = 'Anonymous sign-ins are disabled in Supabase.<br><br>Enable them at:<br>Dashboard → Authentication → Providers → Email → toggle <b>"Allow anonymous sign-ins"</b> → Save.';
+    } else {
+      msg.textContent = m || 'Setup failed';
+    }
+    retry.style.display = 'block';
   }
-}
-
-async function verifyOtpCode() {
-  if (!supabase || !_pendingEmail) return;
-  const token = document.getElementById('auth-code').value.trim();
-  if (!token) return;
-  const btn = document.getElementById('auth-verify-btn');
-  const msg = document.getElementById('auth-msg');
-  btn.disabled = true; btn.textContent = 'Verifying…';
-  msg.className = ''; msg.textContent = '';
-  try {
-    const { error } = await supabase.auth.verifyOtp({
-      email: _pendingEmail, token, type: 'email'
-    });
-    if (error) throw error;
-    // onAuthStateChange fires SIGNED_IN → overlay hides automatically
-  } catch(e) {
-    msg.className = 'error';
-    msg.textContent = (e.message || '').includes('expired')
-      ? 'Code expired — request a new one'
-      : (e.message || 'Invalid code');
-    btn.disabled = false; btn.textContent = 'Verify & sign in';
-  }
-}
-
-function resetAuth() {
-  _pendingEmail = null;
-  document.getElementById('auth-email').value = '';
-  document.getElementById('auth-code').value = '';
-  document.getElementById('auth-step-email').style.display = 'block';
-  document.getElementById('auth-step-code').style.display = 'none';
-  document.getElementById('auth-msg').className = '';
-  document.getElementById('auth-msg').textContent = '';
 }
 
 // ── SYNC STATUS ────────────────────────────────────────────────────────────
