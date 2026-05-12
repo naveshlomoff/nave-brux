@@ -233,6 +233,57 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px;
 /* ── TIP BOX ── */
 .tip-box { background: var(--accentlt); border: 0.5px solid #c4b5fd; border-radius: var(--r); padding: 11px 13px; margin-bottom: 10px; font-family: var(--mono); font-size: 10px; color: var(--text2); line-height: 1.65; }
 .tip-box b { color: var(--accent2); font-weight: 500; }
+
+/* ── AUTH OVERLAY ── */
+#auth-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: var(--bg2);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+#auth-overlay.hidden { display: none; }
+#auth-card {
+  background: var(--bg); border-radius: var(--r2);
+  border: 0.5px solid var(--border2);
+  padding: 32px 24px; width: 100%; max-width: 340px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.auth-logo { text-align: center; }
+.auth-logo .app-title { font-size: 24px; }
+.auth-logo .app-sub { margin-top: 4px; }
+.auth-desc { font-size: 11px; color: var(--text2); line-height: 1.65; text-align: center; }
+#auth-email {
+  width: 100%; padding: 12px 14px;
+  border: 1px solid var(--border2); border-radius: var(--r);
+  font-family: var(--mono); font-size: 13px; color: var(--text);
+  background: var(--bg2); outline: none;
+}
+#auth-email:focus { border-color: var(--accent); }
+#auth-btn {
+  width: 100%; padding: 14px;
+  background: var(--accent); color: #fff; border: none;
+  border-radius: var(--r); font-family: var(--sans);
+  font-size: 14px; font-weight: 700; cursor: pointer;
+}
+#auth-btn:disabled { opacity: 0.5; cursor: default; }
+#auth-msg { font-size: 11px; text-align: center; color: var(--text2); min-height: 16px; }
+#auth-msg.success { color: var(--green); }
+#auth-msg.error   { color: var(--red); }
+
+/* ── SYNC BADGE ── */
+#sync-badge {
+  display: none;
+  position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 62px); right: 14px;
+  z-index: 100; border-radius: 20px; padding: 5px 10px;
+  font-family: var(--mono); font-size: 10px;
+  border: 0.5px solid var(--border2);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+  align-items: center; gap: 5px;
+}
+#sync-badge.show    { display: flex; background: var(--bg);      color: var(--text2); }
+#sync-badge.syncing { display: flex; background: var(--amberlt); color: var(--amber); border-color: var(--amberbd); }
+#sync-badge.synced  { display: flex; background: var(--greenlt); color: var(--green); border-color: var(--greenbd); }
+#sync-badge.error   { display: flex; background: var(--redlt);   color: var(--red);   border-color: var(--redbd); }
 </style>
 <script>
 // iOS: unlock AudioContext on first user touch
@@ -244,6 +295,21 @@ document.addEventListener('touchstart', function iosUnlock() {
 </script>
 </head>
 <body>
+
+<!-- ── AUTH OVERLAY ── -->
+<div id="auth-overlay" class="hidden">
+  <div id="auth-card">
+    <div class="auth-logo">
+      <div class="app-title">BruxTrack</div>
+      <div class="app-sub">sign in to sync your data</div>
+    </div>
+    <p class="auth-desc">Enter your email to receive a sign-in link.<br>One-time setup — stays signed in forever.</p>
+    <input type="email" id="auth-email" placeholder="your@email.com" autocomplete="email">
+    <button id="auth-btn" onclick="sendMagicLink()">Send sign-in link</button>
+    <div id="auth-msg"></div>
+  </div>
+</div>
+
 <div id="app">
 
   <!-- ═══ SCREEN: RECORD ═══ -->
@@ -467,7 +533,14 @@ document.addEventListener('touchstart', function iosUnlock() {
 
 </div>
 <div id="toast"></div>
+<div id="sync-badge"></div>
 
+<script>
+const SUPABASE_URL = 'https://ukoswihzqpztfypqhdnc.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_VTSRe2BT1ppguJKRhwQF3A_xr0rUtBt';
+let supabase;
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 const state = {
   recording: false, startTime: null, events: [],
@@ -476,7 +549,8 @@ const state = {
   animFrame: null, timerInterval: null,
   inEvent: false, eventStart: 0, silenceFrames: 0, eventFrames: 0,
   waveformData: new Float32Array(256), freqData: new Uint8Array(2048),
-  settings: { filterSnore:true, filterImpact:true, filterSpeech:true, saveClips:true, sensitivity:45, placement:'pillow', reportTime:'07:00' }
+  settings: { filterSnore:true, filterImpact:true, filterSpeech:true, saveClips:true, sensitivity:45, placement:'pillow', reportTime:'07:00' },
+  user: null, syncStatus: 'idle'
 };
 
 let db;
@@ -571,6 +645,7 @@ async function stopRecording() {
   const dateStr = todayStr();
   const night = { date:dateStr, duration:Math.round(duration/1000), eventCount:state.events.length, confirmedCount:state.events.filter(e=>e.label==='yes').length, events:state.events };
   await dbPut('nights', night);
+  syncNightToCloud(night); // fire-and-forget — errors caught internally
   toast('Recording saved — check your report!');
   showScreen('events', document.querySelectorAll('.nav-btn')[1]);
 }
@@ -751,7 +826,7 @@ async function playClip(eventId, btn) {
 
 async function confirmEvent(id,label){
   const ev=state.events.find(e=>String(e.id)===String(id));if(ev)ev.label=label;
-  try{const ds=todayStr();const n=await dbGet('nights',ds);if(n){const de=(n.events||[]).find(e=>String(e.id)===String(id));if(de){de.label=label;await dbPut('nights',n);}}}catch(e){}
+  try{const ds=todayStr();const n=await dbGet('nights',ds);if(n){const de=(n.events||[]).find(e=>String(e.id)===String(id));if(de){de.label=label;await dbPut('nights',n);syncNightToCloud(n);}}}catch(e){}
   renderEventsScreen();
 }
 
@@ -792,8 +867,146 @@ async function requestNotif(){if('Notification'in window){const p=await Notifica
 function todayStr(){const d=new Date();if(d.getHours()<10)d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);}
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000);}
 
+// ── SUPABASE AUTH ──────────────────────────────────────────────────────────
+
+function initSupabase() {
+  supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  supabase.auth.onAuthStateChange((_event, session) => {
+    state.user = session?.user ?? null;
+    document.getElementById('auth-overlay').classList.toggle('hidden', !!state.user);
+  });
+  supabase.auth.getSession().then(({ data: { session } }) => {
+    state.user = session?.user ?? null;
+    if (!state.user) document.getElementById('auth-overlay').classList.remove('hidden');
+  });
+}
+
+async function sendMagicLink() {
+  const email = document.getElementById('auth-email').value.trim();
+  if (!email) return;
+  const btn = document.getElementById('auth-btn');
+  const msg = document.getElementById('auth-msg');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+    if (error) throw error;
+    msg.className = 'success'; msg.textContent = 'Check your email — link sent!';
+    btn.textContent = 'Sent ✓';
+  } catch(e) {
+    msg.className = 'error'; msg.textContent = e.message || 'Something went wrong';
+    btn.disabled = false; btn.textContent = 'Send sign-in link';
+  }
+}
+
+// ── SYNC STATUS ────────────────────────────────────────────────────────────
+
+function updateSyncStatus(status) {
+  state.syncStatus = status;
+  const badge = document.getElementById('sync-badge');
+  badge.className = status;
+  if (status === 'syncing') badge.textContent = '⏳ syncing…';
+  else if (status === 'synced') { badge.textContent = '✓ synced'; setTimeout(() => { badge.className = ''; }, 4000); }
+  else if (status === 'error')  badge.textContent = '✗ sync failed';
+}
+
+// ── CLOUD SYNC ─────────────────────────────────────────────────────────────
+
+async function syncNightToCloud(night) {
+  if (!state.user) return;
+  updateSyncStatus('syncing');
+  try {
+    const events = night.events || [];
+    const confirmedCount = events.filter(e => e.label === 'yes').length;
+    const rejectedCount  = events.filter(e => e.label === 'no').length;
+    const nightPayload = {
+      user_id: state.user.id,
+      date: night.date,
+      duration_sec: night.duration || 0,
+      event_count: events.length,
+      confirmed_count: confirmedCount,
+      rejected_count: rejectedCount,
+      confirmation_ratio: events.length > 0 ? confirmedCount / events.length : 0,
+    };
+
+    // Upsert night — select first to get id, then insert or update
+    const { data: existing } = await supabase.from('nights')
+      .select('id').eq('user_id', state.user.id).eq('date', night.date).maybeSingle();
+    let nightId;
+    if (existing) {
+      const { data, error } = await supabase.from('nights').update(nightPayload).eq('id', existing.id).select('id').single();
+      if (error) throw error;
+      nightId = data.id;
+    } else {
+      const { data, error } = await supabase.from('nights').insert(nightPayload).select('id').single();
+      if (error) throw error;
+      nightId = data.id;
+    }
+
+    // Replace events: delete all for this night, then insert fresh
+    await supabase.from('events').delete().eq('night_id', nightId).eq('user_id', state.user.id);
+    if (events.length > 0) {
+      const rows = events.map(ev => ({
+        user_id: state.user.id,
+        night_id: nightId,
+        wall_time: ev.wallTime || ev.timeLabel || '',
+        timestamp_sec: ev.timestamp || 0,
+        duration_sec: ev.duration || 0,
+        peak_hz: ev.peakHz || 0,
+        amplitude: ev.amplitude || 0,
+        db_level: ev.dB || 0,
+        bruxism_score_raw: ev.bruxismScore || 0,
+        label: ev.label === 'yes' ? 'bruxism' : ev.label === 'no' ? 'not_bruxism' : ev.label === 'maybe' ? 'unsure' : 'unconfirmed',
+        has_clip: ev.hasClip || false,
+      }));
+      const { error } = await supabase.from('events').insert(rows);
+      if (error) throw error;
+    }
+
+    // Upload any pending clips (fire-and-forget per clip)
+    for (const ev of events) {
+      if (ev.hasClip && !ev.clipPath) {
+        uploadClipToCloud(ev.id, night.date, nightId).catch(() => {});
+      }
+    }
+
+    updateSyncStatus('synced');
+  } catch(e) {
+    console.error('syncNightToCloud failed', e);
+    updateSyncStatus('error');
+  }
+}
+
+async function uploadClipToCloud(eventId, dateStr, nightId, retries = 2) {
+  if (!state.user) return;
+  try {
+    const record = await dbGet('clips', parseInt(eventId));
+    if (!record?.blob) return;
+    const path = `${state.user.id}/${dateStr}/${eventId}.webm`;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const { error } = await supabase.storage.from('audio-clips')
+          .upload(path, record.blob, { contentType: record.mime || 'audio/webm', upsert: true });
+        if (error) throw error;
+        // Store clip_path back on the event in the cloud
+        await supabase.from('events')
+          .update({ clip_path: path })
+          .eq('night_id', nightId)
+          .eq('timestamp_sec', parseInt(eventId) > 1e12
+            ? Math.round((parseInt(eventId) - (state.startTime||0)) / 1000)
+            : parseInt(eventId))
+          .eq('user_id', state.user.id);
+        return path;
+      } catch(e) {
+        if (attempt === retries) throw e;
+        await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+      }
+    }
+  } catch(e) { console.warn('uploadClipToCloud failed', e); }
+}
+
 async function init(){
   await openDB(); loadSettings();
+  initSupabase();
   if('Notification'in window&&Notification.permission==='default') document.getElementById('notif-banner').style.display='flex';
   if('serviceWorker'in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
   renderHistoryScreen();
