@@ -878,7 +878,7 @@ document.getElementById('sensitivity').addEventListener('change',()=>{state.sett
 document.getElementById('report-time').addEventListener('change',()=>{state.settings.reportTime=document.getElementById('report-time').value;saveSettings();});
 async function requestNotif(){if('Notification'in window){const p=await Notification.requestPermission();if(p==='granted'){document.getElementById('notif-banner').style.display='none';toast('Notifications enabled — morning report scheduled');}}}
 function todayStr(){const d=new Date();if(d.getHours()<10)d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);}
-function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000);}
+function toast(msg, ms){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'), ms || 3000);}
 
 // ── SUPABASE AUTH ──────────────────────────────────────────────────────────
 
@@ -951,13 +951,14 @@ async function signInAnonymous() {
 
 // ── SYNC STATUS ────────────────────────────────────────────────────────────
 
-function updateSyncStatus(status) {
+function updateSyncStatus(status, errMsg) {
   state.syncStatus = status;
+  state.lastSyncError = errMsg || null;
   const badge = document.getElementById('sync-badge');
   badge.className = status;
   if (status === 'syncing') badge.textContent = '⏳ syncing…';
   else if (status === 'synced') { badge.textContent = '✓ synced'; setTimeout(() => { badge.className = ''; }, 4000); }
-  else if (status === 'error')  badge.textContent = '✗ sync failed';
+  else if (status === 'error')  { badge.textContent = '✗ sync failed — tap'; badge.style.cursor = 'pointer'; badge.onclick = () => toast(state.lastSyncError || 'Unknown sync error', 8000); }
 }
 
 // ── CLOUD SYNC ─────────────────────────────────────────────────────────────
@@ -1023,7 +1024,8 @@ async function syncNightToCloud(night) {
     updateSyncStatus('synced');
   } catch(e) {
     console.error('syncNightToCloud failed', e);
-    updateSyncStatus('error');
+    const detail = e?.message || e?.error_description || (typeof e === 'string' ? e : JSON.stringify(e).slice(0,300));
+    updateSyncStatus('error', detail);
   }
 }
 
