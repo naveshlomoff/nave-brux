@@ -381,6 +381,9 @@ document.addEventListener('touchstart', function iosUnlock() {
         </div>
       </div>
 
+      <div class="tip-box" style="margin-top:4px">
+        <b>For reliable overnight recording:</b> keep this app open with screen on (face-down on the nightstand is fine). iOS will pause recording if you switch to another app or lock the phone. The app will auto-recover events if interrupted, but you'll get a partial session.
+      </div>
       <div class="label" style="margin-top:4px">Tonight's flagged events</div>
       <div id="live-events-list">
         <div class="empty">
@@ -534,11 +537,14 @@ document.addEventListener('touchstart', function iosUnlock() {
         <button onclick="clearOldData()" style="margin-top:10px;font-family:var(--mono);font-size:10px;padding:8px 14px;border-radius:8px;background:transparent;border:0.5px solid var(--border2);color:var(--text3);cursor:pointer;letter-spacing:0.06em;text-transform:uppercase">
           Clear data older than 30 days
         </button>
+        <button onclick="clearAllLocalData()" style="margin-top:8px;font-family:var(--mono);font-size:10px;padding:8px 14px;border-radius:8px;background:transparent;border:0.5px solid var(--redbd);color:var(--red);cursor:pointer;letter-spacing:0.06em;text-transform:uppercase">
+          Clear ALL local data (start fresh)
+        </button>
       </div>
 
       <div style="font-family:var(--mono);font-size:10px;color:var(--text3);text-align:center;padding:16px 0;line-height:2">
-        BruxTrack Phase 1 · v0.1.0<br>
-        All processing on-device · no cloud · no tracking
+        BruxTrack Phase 1 · v0.2.0<br>
+        Synced to cloud · RLS-protected · anonymous auth
       </div>
 
     </div></div>
@@ -578,22 +584,33 @@ let supabase;
 <script>
 const state = {
   recording: false, startTime: null, events: [],
+  sessionId: null,                 // unique per recording session (Date.now() at start)
   audioCtx: null, analyser: null, mediaStream: null,
   mediaRecorder: null, chunks: [],
-  animFrame: null, timerInterval: null,
+  animFrame: null, timerInterval: null, draftTimer: null,
   inEvent: false, eventStart: 0, silenceFrames: 0, eventFrames: 0,
   waveformData: new Float32Array(256), freqData: new Uint8Array(2048),
   settings: { filterSnore:true, filterImpact:true, filterSpeech:true, saveClips:true, sensitivity:45, placement:'pillow', reportTime:'07:00' },
-  user: null, syncStatus: 'idle'
+  user: null, syncStatus: 'idle', lastSyncError: null
 };
+let _wakeLock = null;
+let _clipUrlCache = {}; // eventId → blob URL (for iOS gesture-preserving playback)
+
+// "Night date" = startTime shifted back 12h so a session starting at 23:00 OR 02:00 both belong to the same calendar night
+function sessionDate(startTime) {
+  return new Date(startTime - 12*3600*1000).toISOString().slice(0,10);
+}
 
 let db;
 function openDB() {
   return new Promise((res,rej) => {
-    const req = indexedDB.open('BruxTrackDB', 3);
+    const req = indexedDB.open('BruxTrackDB', 4);
     req.onupgradeneeded = e => {
       const d = e.target.result;
-      if (!d.objectStoreNames.contains('nights')) d.createObjectStore('nights',{keyPath:'date'});
+      // v4: nights keyed by sessionId (was: date). Old date-keyed store is dropped — test data is disposable.
+      if (d.objectStoreNames.contains('nights')) d.deleteObjectStore('nights');
+      const ns = d.createObjectStore('nights', {keyPath:'sessionId'});
+      ns.createIndex('date', 'date');
       if (!d.objectStoreNames.contains('events')) {
         const es = d.createObjectStore('events',{keyPath:'id',autoIncrement:true});
         es.createIndex('date','date');
@@ -606,6 +623,7 @@ function openDB() {
     req.onerror = () => rej(req.error);
   });
 }
+function dbDelete(store,key){return new Promise((res,rej)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).delete(key).onsuccess=()=>res();tx.onerror=()=>rej(tx.error);})}
 function dbPut(store,obj){return new Promise((res,rej)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).put(obj).onsuccess=()=>res();tx.onerror=()=>rej(tx.error);})}
 function dbGetAll(store){return new Promise((res,rej)=>{const tx=db.transaction(store,'readonly');const req=tx.objectStore(store).getAll();req.onsuccess=()=>res(req.result);req.onerror=()=>rej(req.error);})}
 function dbGet(store,key){return new Promise((res,rej)=>{const tx=db.transaction(store,'readonly');const req=tx.objectStore(store).get(key);req.onsuccess=()=>res(req.result);req.onerror=()=>rej(req.error);})}
@@ -663,24 +681,96 @@ async function startRecording() {
     };
     state.mediaRecorder.start(1000);
   } catch(e) { console.warn('MediaRecorder unavailable',e); }
-  state.recording=true; state.startTime=Date.now(); state.events=[];
+  state.recording=true;
+  state.startTime=Date.now();
+  state.sessionId=state.startTime;  // session ID = start timestamp (unique per recording)
+  state.events=[];
   state.inEvent=false; state.silenceFrames=0; state.eventFrames=0;
+  // Persist active flag so we can detect interrupted recordings on next page load
+  localStorage.setItem('bt-active-recording', JSON.stringify({
+    sessionId: state.sessionId, startTime: state.startTime, lastSeen: Date.now()
+  }));
+  // Save initial empty draft so the session exists in DB from the start
+  await saveDraftNight();
+  // Keep draft fresh every 30s (so we know recording is alive AND have recent events persisted)
+  state.draftTimer = setInterval(saveDraftNight, 30000);
+  // Wake Lock keeps screen alive → iOS keeps MediaRecorder running
+  acquireWakeLock();
   updateRecordUI(true); startTimer(); analyzeLoop();
-  toast('Recording started — good night!');
+  toast('Recording started — keep screen on for best results', 5000);
+}
+
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    _wakeLock = await navigator.wakeLock.request('screen');
+    _wakeLock.addEventListener('release', () => { _wakeLock = null; });
+  } catch(e) { console.warn('Wake lock failed', e); }
+}
+async function releaseWakeLock() {
+  if (_wakeLock) { try { await _wakeLock.release(); } catch(e) {} _wakeLock = null; }
+}
+// Re-acquire wake lock when tab returns to foreground
+document.addEventListener('visibilitychange', () => {
+  if (state.recording && document.visibilityState === 'visible' && !_wakeLock) acquireWakeLock();
+});
+
+// Save current recording state to IndexedDB as a draft. Called periodically + on every event.
+// If recording is interrupted, the draft survives — we recover it on next app open.
+async function saveDraftNight() {
+  if (!state.recording || !state.sessionId) return;
+  const events = [...state.events];
+  const now = Date.now();
+  const night = {
+    sessionId: state.sessionId,
+    date: sessionDate(state.startTime),
+    startTime: state.startTime,
+    endTime: now,
+    duration: Math.round((now - state.startTime)/1000),
+    events,
+    eventCount: events.length,
+    confirmedCount: events.filter(e=>e.label==='yes').length,
+    rejectedCount: events.filter(e=>e.label==='no').length,
+    draft: true,
+  };
+  try {
+    await dbPut('nights', night);
+    // Refresh active-recording timestamp so we know the loop is alive
+    localStorage.setItem('bt-active-recording', JSON.stringify({
+      sessionId: state.sessionId, startTime: state.startTime, lastSeen: now
+    }));
+  } catch(e) { console.warn('saveDraftNight failed', e); }
 }
 
 async function stopRecording() {
   state.recording = false;
   if(state.animFrame) cancelAnimationFrame(state.animFrame);
   if(state.timerInterval) clearInterval(state.timerInterval);
-  const duration = Date.now() - state.startTime;
+  if(state.draftTimer) { clearInterval(state.draftTimer); state.draftTimer = null; }
+  releaseWakeLock();
+  const endTime = Date.now();
+  const duration = endTime - state.startTime;
   if(state.mediaRecorder && state.mediaRecorder.state!=='inactive') state.mediaRecorder.stop();
   if(state.mediaStream) state.mediaStream.getTracks().forEach(t=>t.stop());
   if(state.audioCtx) state.audioCtx.close();
   updateRecordUI(false);
-  const dateStr = todayStr();
-  const night = { date:dateStr, duration:Math.round(duration/1000), eventCount:state.events.length, confirmedCount:state.events.filter(e=>e.label==='yes').length, events:state.events };
+  // Wait a beat so any in-flight clip saves finish before we snapshot events
+  await new Promise(r => setTimeout(r, 1500));
+  const events = [...state.events];
+  const night = {
+    sessionId: state.sessionId,
+    date: sessionDate(state.startTime),
+    startTime: state.startTime,
+    endTime,
+    duration: Math.round(duration/1000),
+    events,
+    eventCount: events.length,
+    confirmedCount: events.filter(e=>e.label==='yes').length,
+    rejectedCount: events.filter(e=>e.label==='no').length,
+    draft: false,
+  };
   await dbPut('nights', night);
+  localStorage.removeItem('bt-active-recording');
   syncNightToCloud(night); // fire-and-forget — errors caught internally
   toast('Recording saved — check your report!');
   showScreen('events', document.querySelectorAll('.nav-btn')[1]);
@@ -732,11 +822,26 @@ function analyzeLoop() {
 function registerEvent(dur,hz,amp,dB) {
   const el=Math.round((Date.now()-state.startTime)/1000);
   const h=Math.floor(el/3600).toString().padStart(2,'0'), m=Math.floor((el%3600)/60).toString().padStart(2,'0'), s=(el%60).toString().padStart(2,'0');
-  const ev={id:Date.now(),timestamp:el,timeLabel:`T+${h}:${m}:${s}`,wallTime:new Date().toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'}),duration:Math.round(dur*10)/10,peakHz:Math.round(hz),amplitude:Math.round(amp),dB:Math.round(dB),label:'unconfirmed',bruxismScore:Math.min(100,Math.round((amp/128)*100+(dur>5?20:0))),hasClip:false};
+  const ev={
+    id:Date.now(),                  // unique event id (timestamp ms)
+    sessionId:state.sessionId,      // which recording session this belongs to
+    timestamp:el,
+    timeLabel:`T+${h}:${m}:${s}`,
+    wallTime:new Date().toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'}),
+    duration:Math.round(dur*10)/10,
+    peakHz:Math.round(hz),
+    amplitude:Math.round(amp),
+    dB:Math.round(dB),
+    label:'unconfirmed',
+    bruxismScore:Math.min(100,Math.round((amp/128)*100+(dur>5?20:0))),
+    hasClip:false
+  };
   state.events.push(ev);
   document.getElementById('stat-events').textContent = state.events.length;
   saveEventClip(ev);
   addLiveEventCard(ev);
+  // Persist immediately so we don't lose this event if recording is interrupted
+  saveDraftNight();
 }
 
 async function saveEventClip(ev) {
@@ -748,18 +853,11 @@ async function saveEventClip(ev) {
     if (chunks.length === 0) return;
     const mime = state.clipMime || 'audio/webm';
     const blob = new Blob(chunks, {type: mime});
-    await dbPut('clips', {eventId: ev.id, blob, mime});
-    // Mark event as having a clip
+    // Tag clip with sessionId for future garbage collection
+    await dbPut('clips', {eventId: ev.id, sessionId: state.sessionId, blob, mime});
+    // Mark event as having a clip — update in-memory event AND the draft night
     ev.hasClip = true;
-    // Update in DB night record too
-    try {
-      const ds = todayStr();
-      const n = await dbGet('nights', ds);
-      if (n) {
-        const de = (n.events||[]).find(e=>String(e.id)===String(ev.id));
-        if (de) { de.hasClip = true; await dbPut('nights', n); }
-      }
-    } catch(e) {}
+    saveDraftNight();
   } catch(e) { console.warn('saveEventClip failed', e); }
 }
 
@@ -805,11 +903,24 @@ function startTimer() {
   },1000);
 }
 
+let _currentNight = null;
 async function renderEventsScreen() {
-  const dateStr=todayStr();
-  document.getElementById('report-date').textContent='Last night · '+new Date().toLocaleDateString('en',{weekday:'long',month:'long',day:'numeric'});
-  let events=[...state.events];
-  if(!state.recording&&events.length===0){try{const n=await dbGet('nights',dateStr);if(n)events=n.events||[];}catch(e){}}
+  // Find the night to display: if recording, use live state; else load the most recent session from DB
+  let night = null, events = [];
+  if (state.recording && state.sessionId) {
+    night = { sessionId: state.sessionId, date: sessionDate(state.startTime), duration: Math.round((Date.now()-state.startTime)/1000) };
+    events = [...state.events];
+  } else {
+    const nights = await dbGetAll('nights').catch(()=>[]);
+    // Prefer non-draft (completed) sessions; fall back to draft (interrupted) if that's all we have
+    const completed = nights.filter(n => !n.draft).sort((a,b)=>b.startTime-a.startTime);
+    const drafts = nights.filter(n => n.draft).sort((a,b)=>b.startTime-a.startTime);
+    night = completed[0] || drafts[0] || null;
+    events = night ? (night.events||[]) : [];
+  }
+  _currentNight = night;
+  const labelDate = night ? new Date(night.startTime || Date.now()) : new Date();
+  document.getElementById('report-date').textContent = (state.recording?'Live · ':'Last session · ') + labelDate.toLocaleDateString('en',{weekday:'long',month:'long',day:'numeric'}) + (night?.draft?' (interrupted)':'');
   const list=document.getElementById('events-list');
   if(!events.length){list.innerHTML=`<div class="empty"><div class="empty-icon">◎</div><div class="empty-text">No events detected yet.<br>Start a recording session first.</div></div>`;document.getElementById('report-card').style.display='none';document.getElementById('summary-stats').style.display='none';return;}
   const confirmed=events.filter(e=>e.label==='yes').length, rejected=events.filter(e=>e.label==='no').length, total=events.length;
@@ -820,54 +931,135 @@ async function renderEventsScreen() {
   const g=document.getElementById('report-grade');
   if(adj<25){g.className='pill pill-green';g.textContent='low activity';}else if(adj<50){g.className='pill pill-amber';g.textContent='moderate';}else{g.className='pill pill-red';g.textContent='high activity';}
   document.getElementById('sum-events').textContent=total;document.getElementById('sum-confirmed').textContent=confirmed;
-  const night=await dbGet('nights',dateStr).catch(()=>null);
-  const dur=night?night.duration:(state.startTime?Math.floor((Date.now()-state.startTime)/60000):0);
+  const dur = night?.duration || (state.startTime?Math.floor((Date.now()-state.startTime)/60000):0);
   document.getElementById('sum-duration').textContent=dur>3600?Math.floor(dur/3600)+'h '+Math.floor((dur%3600)/60)+'m':Math.floor(dur/60)+' min';
+  // Preload clip URLs so playClip can run synchronously (iOS gesture preservation)
+  preloadClipUrls(events);
   list.innerHTML=events.map(ev=>`<div class="event-item"><div class="event-icon" style="background:var(--accentlt)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div><div class="event-info"><div class="event-time">${ev.wallTime||ev.timeLabel} · ${ev.duration}s</div><div class="event-desc">${ev.peakHz} Hz · ${ev.dB} dB · raw score ${ev.bruxismScore}</div><div class="event-tags">${lbadge(ev.label)}<span class="tag" style="background:var(--hotlt);color:var(--hot)">${ev.duration>15?'long':ev.duration>5?'medium':'short'}</span><span class="tag" style="background:var(--accentlt);color:var(--accent2)">${ev.peakHz<500?'low-freq':ev.peakHz<2000?'mid-freq':'hi-freq'}</span></div><div class="confirm-row">${(ev.hasClip)?`<button class="cfm-btn" style="border-color:#c4b5fd;color:var(--accent2);flex:0 0 auto;padding:7px 10px" onclick="playClip('${ev.id}',this)"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><path d="M5 3l14 9-14 9V3z"/></svg>Play</button>`:'<span style="font-family:var(--mono);font-size:8px;color:var(--text3);align-self:center;flex:0 0 auto">no clip</span>'}<button class="cfm-btn cfm-yes ${ev.label==='yes'?'selected':''}" onclick="confirmEvent('${ev.id}','yes')">Bruxism</button><button class="cfm-btn cfm-no ${ev.label==='no'?'selected':''}" onclick="confirmEvent('${ev.id}','no')">Not bruxism</button><button class="cfm-btn cfm-maybe ${ev.label==='maybe'?'selected':''}" onclick="confirmEvent('${ev.id}','maybe')">Unsure</button></div></div></div>`).join('');
 }
 
 function lbadge(l){if(l==='yes')return`<span class="tag" style="background:var(--greenlt);color:var(--green)">confirmed</span>`;if(l==='no')return`<span class="tag" style="background:var(--redlt);color:var(--red)">rejected</span>`;if(l==='maybe')return`<span class="tag" style="background:var(--amberlt);color:var(--amber)">unsure</span>`;return`<span class="tag" style="background:var(--bg3);color:var(--text3)">unconfirmed</span>`;}
 
+// Pre-build blob URLs for all clips in the current view, so playClip can use them synchronously.
+// This is the iOS user-gesture fix: audio.play() must be called without any prior await.
+async function preloadClipUrls(events) {
+  for (const ev of events) {
+    if (!ev.hasClip || _clipUrlCache[ev.id]) continue;
+    try {
+      const blob = await loadClipBlob(ev.id, ev.clipPath);
+      if (blob) _clipUrlCache[ev.id] = URL.createObjectURL(blob);
+    } catch(e) { /* skip */ }
+  }
+}
+
+// Load a clip's blob: try IndexedDB first, fall back to downloading from Supabase Storage if missing.
+async function loadClipBlob(eventId, clipPath) {
+  try {
+    const local = await dbGet('clips', parseInt(eventId));
+    if (local?.blob) return local.blob;
+  } catch(e) {}
+  // Cloud fallback
+  if (clipPath && supabase && state.user) {
+    try {
+      const { data, error } = await supabase.storage.from('audio-clips').download(clipPath);
+      if (!error && data) {
+        // Cache locally so next playback is instant
+        const mime = data.type || (clipPath.endsWith('.mp4') ? 'audio/mp4' : 'audio/webm');
+        await dbPut('clips', { eventId: parseInt(eventId), blob: data, mime });
+        return data;
+      }
+    } catch(e) { console.warn('cloud clip download failed', e); }
+  }
+  return null;
+}
+
 let _currentAudio = null;
-async function playClip(eventId, btn) {
-  // Stop any currently playing clip
+function _resetPlayButton(btn) {
+  btn.classList.remove('clip-playing');
+  btn.dataset.playing = '0';
+  btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><path d="M5 3l14 9-14 9V3z"/></svg>Play';
+}
+function playClip(eventId, btn) {
+  // Stop any currently playing clip first
   if (_currentAudio) {
-    _currentAudio.pause();
+    try { _currentAudio.pause(); } catch(e) {}
     _currentAudio = null;
-    document.querySelectorAll('.clip-playing').forEach(b => {
-      b.classList.remove('clip-playing');
-      b.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><path d="M5 3l14 9-14 9V3z"/></svg>Play';
-    });
+    document.querySelectorAll('.clip-playing').forEach(_resetPlayButton);
     if (btn.dataset.playing === '1') { btn.dataset.playing = '0'; return; }
   }
-  try {
-    const record = await dbGet('clips', parseInt(eventId));
-    if (!record || !record.blob) { toast('No audio clip saved for this event'); return; }
-    const url = URL.createObjectURL(record.blob);
-    const audio = new Audio(url);
+  // Synchronous path: use pre-cached URL (preserves iOS user gesture)
+  const cachedUrl = _clipUrlCache[parseInt(eventId)] || _clipUrlCache[eventId];
+  if (cachedUrl) {
+    const audio = new Audio(cachedUrl);
     _currentAudio = audio;
     btn.classList.add('clip-playing');
     btn.dataset.playing = '1';
     btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Stop';
-    audio.play().catch(e => { toast('Could not play audio: ' + e.message); });
-    audio.onended = () => {
-      URL.revokeObjectURL(url);
-      _currentAudio = null;
-      btn.classList.remove('clip-playing');
-      btn.dataset.playing = '0';
-      btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><path d="M5 3l14 9-14 9V3z"/></svg>Play';
-    };
-  } catch(e) { toast('Error loading clip: ' + e.message); }
+    audio.play().catch(e => { toast('Could not play audio: ' + e.message); _resetPlayButton(btn); });
+    audio.onended = () => { _currentAudio = null; _resetPlayButton(btn); };
+    return;
+  }
+  // Async fallback: clip not pre-cached (e.g. not yet downloaded from cloud)
+  (async () => {
+    try {
+      btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle;margin-right:3px"><circle cx="12" cy="12" r="10"/></svg>Loading…';
+      const ev = (_currentNight?.events || state.events).find(e => String(e.id) === String(eventId));
+      const blob = await loadClipBlob(eventId, ev?.clipPath);
+      if (!blob) { toast('Audio clip not available (not yet uploaded or already deleted)'); _resetPlayButton(btn); return; }
+      const url = URL.createObjectURL(blob);
+      _clipUrlCache[parseInt(eventId)] = url;
+      const audio = new Audio(url);
+      _currentAudio = audio;
+      btn.classList.add('clip-playing');
+      btn.dataset.playing = '1';
+      btn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" style="vertical-align:middle;margin-right:3px"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Stop';
+      audio.play().catch(e => { toast('Could not play audio: ' + e.message); _resetPlayButton(btn); });
+      audio.onended = () => { _currentAudio = null; _resetPlayButton(btn); };
+    } catch(e) { toast('Error loading clip: ' + e.message); _resetPlayButton(btn); }
+  })();
 }
 
 async function confirmEvent(id,label){
-  const ev=state.events.find(e=>String(e.id)===String(id));if(ev)ev.label=label;
-  try{const ds=todayStr();const n=await dbGet('nights',ds);if(n){const de=(n.events||[]).find(e=>String(e.id)===String(id));if(de){de.label=label;await dbPut('nights',n);syncNightToCloud(n);}}}catch(e){}
+  // Update in live recording state
+  const liveEv = state.events.find(e=>String(e.id)===String(id));
+  if (liveEv) liveEv.label = label;
+  // Update in the currently-displayed night (most recent session)
+  try {
+    if (_currentNight && _currentNight.sessionId) {
+      const n = await dbGet('nights', _currentNight.sessionId);
+      if (n) {
+        const de = (n.events||[]).find(e=>String(e.id)===String(id));
+        if (de) {
+          de.label = label;
+          // Recalc counts
+          n.confirmedCount = (n.events||[]).filter(e=>e.label==='yes').length;
+          n.rejectedCount  = (n.events||[]).filter(e=>e.label==='no').length;
+          await dbPut('nights', n);
+          syncNightToCloud(n);
+        }
+      }
+    }
+  } catch(e) { console.warn('confirmEvent failed', e); }
   renderEventsScreen();
 }
 
 async function renderHistoryScreen(){
-  const nights=await dbGetAll('nights').catch(()=>[]);
+  const sessions = await dbGetAll('nights').catch(()=>[]);
+  // Group sessions by their night date (a date may have multiple sessions e.g. multiple recordings same night)
+  const byDate = {};
+  for (const s of sessions) {
+    if (!s.date) continue;
+    (byDate[s.date] = byDate[s.date] || []).push(s);
+  }
+  // For each date, aggregate metrics (sum events, max duration)
+  const nights = Object.keys(byDate).map(date => {
+    const sess = byDate[date];
+    const eventCount = sess.reduce((a,b)=>a+(b.eventCount||0), 0);
+    const confirmedCount = sess.reduce((a,b)=>a+(b.confirmedCount||0), 0);
+    const duration = sess.reduce((a,b)=>a+(b.duration||0), 0);
+    return { date, eventCount, confirmedCount, duration, sessionCount: sess.length };
+  }).sort((a,b)=>a.date.localeCompare(b.date));
+
   const cal=document.getElementById('cal-grid');
   const now=new Date(),year=now.getFullYear(),month=now.getMonth();
   const firstDay=new Date(year,month,1).getDay(),daysInMonth=new Date(year,month+1,0).getDate();
@@ -877,7 +1069,15 @@ async function renderHistoryScreen(){
   renderTrendChart(nights);
   const nl=document.getElementById('nights-list');
   if(!nights.length){nl.innerHTML=`<div class="empty"><div class="empty-icon">◎</div><div class="empty-text">No nights recorded yet.</div></div>`;return;}
-  nl.innerHTML=nights.slice().reverse().map(n=>{const d=new Date(n.date+'T00:00:00');const lbl=d.toLocaleDateString('en',{weekday:'short',month:'short',day:'numeric'});const dh=Math.floor(n.duration/3600),dm=Math.floor((n.duration%3600)/60);const ds=n.duration>3600?`${dh}h ${dm}m`:`${dm} min`;const gc=n.eventCount<5?'pill-green':n.eventCount<12?'pill-amber':'pill-red';return`<div class="night-item"><div class="night-item-left"><h3>${lbl}</h3><p>${ds} · ${n.confirmedCount||0} confirmed</p></div><span class="pill ${gc}">${n.eventCount} events</span></div>`;}).join('');
+  nl.innerHTML=nights.slice().reverse().map(n=>{
+    const d=new Date(n.date+'T00:00:00');
+    const lbl=d.toLocaleDateString('en',{weekday:'short',month:'short',day:'numeric'});
+    const dh=Math.floor(n.duration/3600),dm=Math.floor((n.duration%3600)/60);
+    const ds=n.duration>3600?`${dh}h ${dm}m`:`${dm} min`;
+    const gc=n.eventCount<5?'pill-green':n.eventCount<12?'pill-amber':'pill-red';
+    const sessTag = n.sessionCount>1 ? ` · ${n.sessionCount} sessions` : '';
+    return`<div class="night-item"><div class="night-item-left"><h3>${lbl}</h3><p>${ds} · ${n.confirmedCount||0} confirmed${sessTag}</p></div><span class="pill ${gc}">${n.eventCount} events</span></div>`;
+  }).join('');
 }
 
 function renderTrendChart(nights){
@@ -894,7 +1094,30 @@ function renderTrendChart(nights){
 function toggleSwitch(el){el.classList.toggle('on');const id=el.id;if(id==='sw-snore')state.settings.filterSnore=el.classList.contains('on');if(id==='sw-impact')state.settings.filterImpact=el.classList.contains('on');if(id==='sw-speech')state.settings.filterSpeech=el.classList.contains('on');if(id==='sw-clips')state.settings.saveClips=el.classList.contains('on');saveSettings();}
 function selectPlacement(el){document.querySelectorAll('.placement-opt').forEach(o=>o.classList.remove('selected'));el.classList.add('selected');state.settings.placement=el.dataset.val;saveSettings();}
 async function renderStorageInfo(){try{if(navigator.storage&&navigator.storage.estimate){const e=await navigator.storage.estimate();const used=Math.round((e.usage||0)/1024/1024);const quota=Math.round((e.quota||0)/1024/1024/1024*10)/10;document.getElementById('storage-info').textContent=`${used} MB used of ${quota} GB available`;}}catch(e){}}
-async function clearOldData(){const cutoff=new Date();cutoff.setDate(cutoff.getDate()-30);const nights=await dbGetAll('nights').catch(()=>[]);let n=0;for(const nt of nights){if(new Date(nt.date)<cutoff){try{const tx=db.transaction('nights','readwrite');tx.objectStore('nights').delete(nt.date);n++;}catch(e){}}}toast(n>0?`Cleared ${n} old nights`:'Nothing old enough to clear');}
+async function clearOldData(){
+  // Delete sessions older than 30 days. Use sessionId as key (new schema).
+  const cutoff = Date.now() - 30*86400*1000;
+  const nights = await dbGetAll('nights').catch(()=>[]);
+  let n = 0;
+  for (const nt of nights) {
+    if ((nt.startTime || 0) < cutoff) {
+      try { await dbDelete('nights', nt.sessionId); n++; } catch(e) {}
+    }
+  }
+  toast(n>0 ? `Cleared ${n} old sessions` : 'Nothing old enough to clear');
+}
+async function clearAllLocalData(){
+  if (!confirm('Delete ALL local nights, events and audio clips? This cannot be undone (cloud data is kept).')) return;
+  try {
+    const nights = await dbGetAll('nights').catch(()=>[]);
+    for (const n of nights) await dbDelete('nights', n.sessionId);
+    const clips = await dbGetAll('clips').catch(()=>[]);
+    for (const c of clips) await dbDelete('clips', c.eventId);
+    _clipUrlCache = {};
+    localStorage.removeItem('bt-active-recording');
+    toast('All local data cleared');
+  } catch(e) { toast('Clear failed: ' + e.message); }
+}
 function saveSettings(){localStorage.setItem('bruxtrack-settings',JSON.stringify(state.settings));}
 function loadSettings(){try{const s=JSON.parse(localStorage.getItem('bruxtrack-settings')||'{}');Object.assign(state.settings,s);if(state.settings.sensitivity){document.getElementById('sensitivity').value=state.settings.sensitivity;document.getElementById('sens-val').textContent=state.settings.sensitivity;}if(state.settings.reportTime)document.getElementById('report-time').value=state.settings.reportTime;}catch(e){}}
 document.getElementById('sensitivity').addEventListener('change',()=>{state.settings.sensitivity=parseInt(document.getElementById('sensitivity').value);saveSettings();});
@@ -999,6 +1222,7 @@ function updateSyncStatus(status, errMsg) {
 
 async function syncNightToCloud(night) {
   if (!state.user) return;
+  if (!night?.sessionId) return; // need a session id to identify the cloud row uniquely
   updateSyncStatus('syncing');
   try {
     const events = night.events || [];
@@ -1006,6 +1230,7 @@ async function syncNightToCloud(night) {
     const rejectedCount  = events.filter(e => e.label === 'no').length;
     const nightPayload = {
       user_id: state.user.id,
+      session_id: night.sessionId,
       date: night.date,
       duration_sec: night.duration || 0,
       event_count: events.length,
@@ -1014,9 +1239,9 @@ async function syncNightToCloud(night) {
       confirmation_ratio: events.length > 0 ? confirmedCount / events.length : 0,
     };
 
-    // Upsert night — select first to get id, then insert or update
+    // Upsert night by (user_id, session_id) — each recording session = one cloud row, no overwrites
     const { data: existing } = await supabase.from('nights')
-      .select('id').eq('user_id', state.user.id).eq('date', night.date).maybeSingle();
+      .select('id').eq('user_id', state.user.id).eq('session_id', night.sessionId).maybeSingle();
     let nightId;
     if (existing) {
       const { data, error } = await supabase.from('nights').update(nightPayload).eq('id', existing.id).select('id').single();
@@ -1028,7 +1253,7 @@ async function syncNightToCloud(night) {
       nightId = data.id;
     }
 
-    // Replace events: delete all for this night, then insert fresh
+    // Replace events for this session: delete all, then insert fresh
     await supabase.from('events').delete().eq('night_id', nightId).eq('user_id', state.user.id);
     if (events.length > 0) {
       const rows = events.map(ev => ({
@@ -1051,7 +1276,7 @@ async function syncNightToCloud(night) {
     // Upload any pending clips (fire-and-forget per clip)
     for (const ev of events) {
       if (ev.hasClip && !ev.clipPath) {
-        uploadClipToCloud(ev.id, night.date, nightId).catch(() => {});
+        uploadClipToCloud(ev.id, night.sessionId, nightId).catch(() => {});
       }
     }
 
@@ -1071,28 +1296,37 @@ async function syncNightToCloud(night) {
   }
 }
 
-async function uploadClipToCloud(eventId, dateStr, nightId, retries = 2) {
+// uploadClipToCloud(eventId, sessionId, nightCloudId)
+// Path layout: {user_id}/{sessionId}/{eventId}.{ext} — keeps each recording's clips together
+async function uploadClipToCloud(eventId, sessionId, nightCloudId, retries = 2) {
   if (!state.user) return;
   try {
     const record = await dbGet('clips', parseInt(eventId));
     if (!record?.blob) return;
-    // Derive extension from saved mime (mp4 on iOS, webm on Android/desktop)
     const mime = record.mime || 'audio/webm';
     const ext = mime.includes('mp4') ? 'mp4' : mime.includes('webm') ? 'webm' : 'bin';
-    const path = `${state.user.id}/${dateStr}/${eventId}.${ext}`;
+    const path = `${state.user.id}/${sessionId}/${eventId}.${ext}`;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const { error } = await supabase.storage.from('audio-clips')
           .upload(path, record.blob, { contentType: mime, upsert: true });
         if (error) throw error;
-        // Store clip_path back on the event in the cloud
-        await supabase.from('events')
-          .update({ clip_path: path })
-          .eq('night_id', nightId)
-          .eq('timestamp_sec', parseInt(eventId) > 1e12
-            ? Math.round((parseInt(eventId) - (state.startTime||0)) / 1000)
-            : parseInt(eventId))
-          .eq('user_id', state.user.id);
+        // Persist clip_path in the cloud events row, matching by night_id + event ms id
+        // (we stored timestamp_sec = ev.timestamp, not ev.id, so match by night_id + has_clip + the seconds value)
+        // Better: store a stable identifier — for now, find by night_id and exact timestamp_sec
+        // We re-derive timestamp_sec from the local clip's sessionId tagging
+        try {
+          const ev = (_currentNight?.events || state.events).find(e => String(e.id) === String(eventId));
+          if (ev && typeof ev.timestamp === 'number') {
+            await supabase.from('events')
+              .update({ clip_path: path, has_clip: true })
+              .eq('night_id', nightCloudId)
+              .eq('user_id', state.user.id)
+              .eq('timestamp_sec', ev.timestamp);
+            // Also update local event so future syncs skip the upload
+            ev.clipPath = path;
+          }
+        } catch(e) { console.warn('clip_path update failed', e); }
         return path;
       } catch(e) {
         if (attempt === retries) throw e;
@@ -1105,6 +1339,25 @@ async function uploadClipToCloud(eventId, dateStr, nightId, retries = 2) {
 async function init(){
   await openDB(); loadSettings();
   initSupabase();
+  // Check for an interrupted recording session and recover its draft
+  try {
+    const orphan = JSON.parse(localStorage.getItem('bt-active-recording') || 'null');
+    if (orphan?.sessionId) {
+      const draft = await dbGet('nights', orphan.sessionId);
+      if (draft?.draft) {
+        // Finalize the interrupted session — keep the events we did capture
+        draft.draft = false;
+        draft.endTime = orphan.lastSeen || draft.endTime || Date.now();
+        draft.duration = Math.round(((draft.endTime - draft.startTime) || 0) / 1000);
+        await dbPut('nights', draft);
+        // Wait for Supabase auth to settle, then sync
+        setTimeout(() => { if (state.user) syncNightToCloud(draft); }, 3000);
+        const mins = Math.round((draft.duration || 0) / 60);
+        toast(`Recovered ${draft.events?.length || 0} events from interrupted recording (${mins}m)`, 7000);
+      }
+      localStorage.removeItem('bt-active-recording');
+    }
+  } catch(e) { console.warn('orphan recovery failed', e); }
   if('Notification'in window&&Notification.permission==='default') document.getElementById('notif-banner').style.display='flex';
   if('serviceWorker'in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
   renderHistoryScreen();
