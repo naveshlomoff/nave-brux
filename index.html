@@ -844,23 +844,30 @@ function analyzeLoop() {
   }
   const peakBruxHz = Math.round(peakBruxBin*bin); // peak Hz WITHIN the bruxism band
   const sens=state.settings.sensitivity;
-  const thresh=Math.round(2+((sens-20)/75)*16);
+  // Threshold formula v5: raised baseline so thresh at sens=70 is ~25, above 16x-amplified
+  // ambient noise (~15-20). Old formula (range 2-18) was always below ambient, so silence
+  // was never detected after grinding stopped — events never closed.
+  // New range [10, 32]: quiet enough to catch grinding, high enough to clear ambient.
+  const thresh=Math.round(10+((sens-20)/75)*22);
   // Adaptive noise floor: EMA of peakBrux during quiet (non-event) frames only.
-  // Faster downward tracking (0.03) to catch quieting rooms; slow upward (0.003) so the
-  // floor doesn't chase a sustained loud event.
+  // Initialized to 0 (NOT to peakBrux — that caused the floor to immediately inflate to
+  // the grinding level on frame-1 of a test, making dynThresh=160 and blocking all detection).
+  // Upward alpha=0.015 → converges to ambient in ~2s of quiet.
+  // Downward alpha=0.03 → tracks room quieting quickly.
   if (!state.inEvent) {
-    if (state.noiseFloor === null || state.noiseFloor === undefined) state.noiseFloor = peakBrux;
-    const alpha = peakBrux < state.noiseFloor ? 0.03 : 0.003;
+    if (state.noiseFloor === null || state.noiseFloor === undefined) state.noiseFloor = 0;
+    const alpha = peakBrux < state.noiseFloor ? 0.03 : 0.015;
     state.noiseFloor = state.noiseFloor * (1 - alpha) + peakBrux * alpha;
   }
   const nf = state.noiseFloor || 0;
-  // Dynamic threshold = max(absolute, 2.2× noise floor + 4)
-  // Quiet room (nf≈3) → dynThresh ≈ 10.6 → absolute thresh applies (good sensitivity)
-  // Noisy room (nf≈20) → dynThresh ≈ 48 → only loud spikes like real grinding trigger
+  // Dynamic threshold = max(absolute thresh, 2.2× noise floor + 4).
+  // When floor is near 0 (just started): dynThresh = thresh ≈ 25. Ambient 15-20 < 25 → silence OK.
+  // When floor calibrated to ambient (e.g. 20): dynThresh = max(25, 48) = 48 → only grinding triggers.
   const dynThresh = Math.max(thresh, nf * 2.2 + 4);
-  // Trigger on peak energy in the bruxism band. Also catch diffuse grinding where energy
-  // is spread across the band rather than concentrated in one peak.
-  let cand = (peakBrux > dynThresh) || (bruxBand > dynThresh * 0.8);
+  // Trigger on peak energy in bruxism band ONLY (peakBrux). Removed bruxBand OR condition —
+  // bruxBand (average) gets elevated by ambient noise even when there's no event, causing
+  // false positives during ambient-noise periods.
+  let cand = (peakBrux > dynThresh);
   let rejReason = '';
   // FILTER (snore): reject if low-freq strongly dominates (snoring pattern).
   if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
