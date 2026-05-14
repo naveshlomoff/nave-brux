@@ -669,12 +669,19 @@ async function startRecording() {
     await state.audioCtx.resume();
   }
   const source = state.audioCtx.createMediaStreamSource(state.mediaStream);
+  // GAIN: iOS Safari applies voice-processing that heavily attenuates non-speech sounds
+  // (teeth grinding gets gated as "noise"). Captured signal arrives at ~-78 dB instead of
+  // the real ~-40 dB. We pre-amplify 6x BEFORE the analyser to bring the bruxism band
+  // back into a usable detection range.
+  const inputGain = state.audioCtx.createGain();
+  inputGain.gain.value = 6;
   state.analyser = state.audioCtx.createAnalyser();
   state.analyser.fftSize = 2048;
-  state.analyser.smoothingTimeConstant = 0.2; // was 0.8 — too smoothed for transient detection
-  state.analyser.minDecibels = -90;
+  state.analyser.smoothingTimeConstant = 0.2;
+  state.analyser.minDecibels = -100;
   state.analyser.maxDecibels = -10;
-  source.connect(state.analyser);
+  source.connect(inputGain);
+  inputGain.connect(state.analyser);
   // iOS Safari WORKAROUND: AnalyserNode often returns zeros unless the audio graph
   // is connected end-to-end. We route through a muted gain to destination so the
   // graph is "live" without producing audible output.
@@ -832,9 +839,10 @@ function analyzeLoop() {
     if(state.freqData[i]>peakBrux){ peakBrux=state.freqData[i]; peakBruxBin=i; }
   }
   const peakBruxHz = Math.round(peakBruxBin*bin); // peak Hz WITHIN the bruxism band
-  // Sensitivity slider 20–95 → threshold 8–48 (more permissive than v3: 12–55)
+  // Sensitivity slider 20–95 → threshold 3–35 (very permissive — iOS gates signal)
+  // Combined with 6x input gain, this catches even iOS-attenuated grinding signal.
   const sens=state.settings.sensitivity;
-  const thresh=Math.round(8+((sens-20)/75)*40);
+  const thresh=Math.round(3+((sens-20)/75)*32);
   let cand=peakBrux>thresh;
   let rejReason = '';
   // FILTER (snore): reject only if low-freq STRONGLY dominates bruxism band.
