@@ -675,7 +675,7 @@ async function startRecording() {
   // the mic only catches a small fraction of what the user perceives. We pre-amplify 12x
   // BEFORE the analyser to bring even faint grinding into a usable detection range.
   const inputGain = state.audioCtx.createGain();
-  inputGain.gain.value = 12;
+  inputGain.gain.value = 16;
   state.analyser = state.audioCtx.createAnalyser();
   state.analyser.fftSize = 2048;
   state.analyser.smoothingTimeConstant = 0.2;
@@ -841,12 +841,15 @@ function analyzeLoop() {
   }
   const peakBruxHz = Math.round(peakBruxBin*bin); // peak Hz WITHIN the bruxism band
   // Sensitivity slider 20–95 → threshold 2–18 (extremely permissive)
-  // With 12x input gain, faint grinding signals (mostly bone-conducted, mostly gated by
+  // With 16x input gain, faint grinding signals (mostly bone-conducted, mostly gated by
   // iOS voice processing) should clear this. May cause false positives in noisy rooms —
   // user labels handle that.
   const sens=state.settings.sensitivity;
   const thresh=Math.round(2+((sens-20)/75)*16);
-  let cand=peakBrux>thresh;
+  // Trigger on EITHER peak energy OR average energy in the bruxism band.
+  // Sharp grinding bursts: peakBrux clears the threshold.
+  // Diffuse sustained grinding (energy spread across bins): bruxBand average clears it.
+  let cand = (peakBrux > thresh) || (bruxBand > thresh * 0.6);
   let rejReason = '';
   // FILTER (snore): reject only if low-freq STRONGLY dominates bruxism band.
   // v3 was 0.75x — too aggressive, grinding has natural low-freq from jaw bone conduction.
@@ -869,7 +872,7 @@ function analyzeLoop() {
       state._dbgMaxBrux = peakBrux;
       state._dbgMaxTime = Date.now();
     }
-    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> (5s max:<b style="color:var(--accent)">${state._dbgMaxBrux}</b>) thr:<b>${thresh}</b><br>snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
+    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx peak:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> (5s max:<b style="color:var(--accent)">${state._dbgMaxBrux}</b>) thr:<b>${thresh}</b><br>snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
   }
   // Visual level bars
   const dbEl = document.getElementById('level-db');
