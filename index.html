@@ -974,9 +974,24 @@ function registerEvent(dur,hz,amp,dB) {
 async function saveEventClip(ev) {
   if (!state.mediaRecorder || !state.rollingChunks || state.rollingChunks.length === 0) return;
   try {
-    // Wait a bit for the current chunk to arrive (event just ended)
+    // Wait a beat for the current chunk to arrive (event just ended)
     await new Promise(r => setTimeout(r, 1200));
-    const chunks = [...state.rollingChunks];
+    // ── CLIP TRIMMING ─────────────────────────────────────────────────────────────
+    // BUG (fixed): taking ALL rollingChunks (full 20-second window) meant the FIRST
+    // event of a session included audio from T=0 (start of recording) — e.g. the user
+    // saying "test test" before grinding. This made the clip sound like an old session.
+    //
+    // Fix: trim to start from 2 seconds before this event began.
+    //   ev.id         = Date.now() when event was registered (= end of event)
+    //   ev.duration   = seconds the event lasted
+    //   → event started at approx (ev.id - duration*1000)
+    //   → clip starts  at approx (ev.id - (duration + 2) * 1000)
+    //
+    // For overnight recordings this gives a clip of duration+2 seconds — plenty of
+    // context. For testing it avoids capturing whatever the user said 15s earlier.
+    const clipStartTime = (ev.id || Date.now()) - ((ev.duration || 0) + 2) * 1000;
+    const startIdx = state.chunkTimestamps.findIndex(t => t >= clipStartTime);
+    const chunks = startIdx >= 0 ? state.rollingChunks.slice(startIdx) : [...state.rollingChunks];
     if (chunks.length === 0) return;
     const mime = state.clipMime || 'audio/webm';
     const blob = new Blob(chunks, {type: mime});
@@ -1034,6 +1049,11 @@ let _currentNight = null;
 async function renderEventsScreen() {
   // Find the night to display: if recording, use live state; else load the most recent session from DB
   let night = null, events = [];
+  // Clear stale cached blob URLs from any previous session view.
+  // Blob URLs are page-session scoped — they're still valid, but we need to
+  // re-verify they match the night we're about to show, and clearing is cheap
+  // because preloadClipUrls re-populates asynchronously from local IndexedDB.
+  _clipUrlCache = {};
   if (state.recording && state.sessionId) {
     night = { sessionId: state.sessionId, date: sessionDate(state.startTime), duration: Math.round((Date.now()-state.startTime)/1000) };
     events = [...state.events];
