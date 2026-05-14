@@ -876,25 +876,18 @@ function analyzeLoop() {
   let rejReason = '';
   // FILTER (snore): reject if low-freq strongly dominates (snoring pattern).
   if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
-  // FILTER (speech): two complementary checks that catch speech but NOT grinding.
+  // FILTER (speech): only catch sibilants/fricatives (s, sh, f sounds) via high-freq presence.
   //
-  //   (a) Sibilants / fricatives: high-freq presence dominates over mid (s, sh, f sounds).
-  //       Catches unvoiced consonants. Threshold presence > midBand*1.4 is rarely met by grinding.
+  // REMOVED: bass > lowMid ratio check (was > 0.9, then tried various thresholds).
+  // Reason: grinding bone-conducted through jaw → skull → pillow generates strong bass
+  // (measured ba=58, lo=32, ba/lo=1.80 during actual grinding attempt). This is indistinguishable
+  // from voiced speech using the bass/lowMid ratio. Any bass threshold that catches speech
+  // also catches grinding — confirmed by user screenshot showing × speech on real grinding.
   //
-  //   (b) Voiced speech fundamental: bass (80-250 Hz) ≥ 90% of lowMid (250-800 Hz).
-  //       Voiced speech has strong bass fundamental whose 1st harmonics fall in lowMid
-  //       → bass ≈ lowMid for speech ("ניסיון").
-  //       Grinding is concentrated in lowMid+midBand and creates very little bass
-  //       → bass << lowMid for grinding (ratio ≈ 0.3-0.5, well below 0.9 threshold).
-  //
-  //   NOTE: previous version used bass > bruxBand*0.8 — WRONG. bruxBand = (lowMid+midBand)/2
-  //   which includes lowMid. Grinding raises lowMid, making bruxBand bigger, which made
-  //   bruxBand*0.8 close to bass even for grinding (false positive filter).
-  //   Using lowMid directly gives a clean separation.
-  if(state.settings.filterSpeech && (
-    (presence > midBand*1.4 && presence > 50) ||
-    (bass > lowMid*0.9 && bass > 25)
-  )){ cand=false; rejReason='speech'; }
+  // Decision: accept voiced speech ("ניסיון") as occasional false positive for Phase 1.
+  // The user labels it "not_bruxism" in the morning report. Missing grinding = far worse
+  // than a few extra events to label. Will revisit with spectral/temporal features in Phase 4.
+  if(state.settings.filterSpeech && presence > midBand*1.4 && presence > 50){ cand=false; rejReason='speech'; }
   // ONSET=3 (~50ms to confirm event start), OFFSET=8 (~130ms silence to close event — faster
   // registration than v4's 250ms so user sees feedback sooner), MIN=3 frames + ≥0.2s duration.
   // Max event duration capped at 8s to prevent one giant event from sustained noise.
@@ -943,9 +936,11 @@ function analyzeLoop() {
       state._dbgMaxBrux = peakBrux;
       state._dbgMaxTime = Date.now();
     }
-    // ba/lo ratio is the speech filter discriminator: speech→ratio≈1.0+, grinding→ratio≈0.3-0.5
     const _baLoRatio = lowMid > 0 ? (bass/lowMid).toFixed(2) : '—';
-    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> · floor:<b style="color:var(--text2)">${Math.round(nf)}</b> dyn:<b style="color:var(--accent)">${Math.round(dynThresh)}</b><br>ba:<b>${Math.round(bass)}</b> lo:<b>${Math.round(lowMid)}</b> <span style="color:var(--text3)">ba/lo:${_baLoRatio}</span> · snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
+    // gap = how far peakBrux is above noise floor — positive = detected, negative = below threshold
+    const _gap = peakBrux - Math.round(nf);
+    const _gapColor = _gap > 0 ? 'var(--green)' : 'var(--red)';
+    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> · floor:<b style="color:var(--text2)">${Math.round(nf)}</b> dyn:<b style="color:var(--accent)">${Math.round(dynThresh)}</b> <span style="color:${_gapColor}">gap:${_gap>0?'+':''}${_gap}</span><br>ba:<b>${Math.round(bass)}</b> lo:<b>${Math.round(lowMid)}</b> <span style="color:var(--text3)">ba/lo:${_baLoRatio}</span> · snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
   }
   // Visual level bars
   const dbEl = document.getElementById('level-db');
