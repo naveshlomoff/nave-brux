@@ -379,6 +379,7 @@ document.addEventListener('touchstart', function iosUnlock() {
           <div class="stat-card"><div class="stat-val" id="stat-db" style="color:var(--text2)">—</div><div class="stat-lbl">dB level</div></div>
           <div class="stat-card"><div class="stat-val" id="stat-freq" style="color:var(--accent)">—</div><div class="stat-lbl">peak Hz</div></div>
         </div>
+        <div id="stat-debug" style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text3);text-align:center;letter-spacing:0.04em;padding:6px;background:var(--bg2);border-radius:var(--r);border:0.5px dashed var(--border2)">— start recording to see live detection signals —</div>
       </div>
 
       <div class="tip-box" style="margin-top:4px">
@@ -790,29 +791,38 @@ function analyzeLoop() {
   let rms=0; for(let i=0;i<state.waveformData.length;i++) rms+=state.waveformData[i]**2;
   rms=Math.sqrt(rms/state.waveformData.length);
   const dB = rms>0?Math.round(20*Math.log10(rms)):-100;
-    // ── DETECTION v3 ──────────────────────────────────────────────
-  // Peak energy strictly inside bruxism band (250–3500 Hz)
+  // ── DETECTION v4 (May 2026) ───────────────────────────────────
+  // v3 had FILTER 1: `if (peakHz < 200) cand = false` — peakHz is the dominant frequency across
+  // the WHOLE spectrum, not just the bruxism band. Any low-freq hum (AC, fridge, electrical 50Hz)
+  // pulled peakHz below 200 even during loud grinding → every event got silently rejected.
+  // Removed entirely. We rely on bruxism-band peak + sane low/high band ratio filters.
   const l250=Math.floor(250/bin), h3500=Math.ceil(3500/bin);
-  let peakBrux=0;
+  let peakBrux=0, peakBruxBin=l250;
   for(let i=l250;i<=h3500&&i<state.freqData.length;i++){
-    if(state.freqData[i]>peakBrux) peakBrux=state.freqData[i];
+    if(state.freqData[i]>peakBrux){ peakBrux=state.freqData[i]; peakBruxBin=i; }
   }
-  // Map slider 20–95 → threshold 12–55
+  const peakBruxHz = Math.round(peakBruxBin*bin); // peak Hz WITHIN the bruxism band
+  // Sensitivity slider 20–95 → threshold 8–48 (more permissive than v3: 12–55)
   const sens=state.settings.sensitivity;
-  const thresh=Math.round(12+((sens-20)/75)*43);
+  const thresh=Math.round(8+((sens-20)/75)*40);
   let cand=peakBrux>thresh;
-  // FILTER 1 — peak Hz must be in bruxism range (rejects speech at 80–200 Hz)
-  if(peakHz < 200) cand=false;
-  // FILTER 2 — snore: low-freq dominates
-  if(state.settings.filterSnore&&snoreBand>peakBrux*0.75&&snoreBand>18) cand=false;
-  // FILTER 3 — speech: strong formant structure (presence tracks mid band closely)
-  if(state.settings.filterSpeech&&presence>midBand*1.1&&presence>30) cand=false;
-  // ONSET=5 frames (~0.33s), OFFSET=15 frames (~1s), MIN=8 frames (~0.5s) before registering
-  // This means event must sustain ~0.33s to start, and be at least ~0.5s long
-  const ONSET=5, OFFSET=15, MIN=8;
+  let rejReason = '';
+  // FILTER (snore): reject only if low-freq STRONGLY dominates bruxism band.
+  // v3 was 0.75x — too aggressive, grinding has natural low-freq from jaw bone conduction.
+  if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
+  // FILTER (speech): reject only if high-freq presence dominates AND is loud.
+  if(state.settings.filterSpeech && presence>midBand*1.4 && presence>50){ cand=false; rejReason='speech'; }
+  // ONSET=5 (~0.33s) before event starts, OFFSET=15 (~1s) silence to end, MIN=5 frames + ≥0.4s duration
+  // v3 required ≥1.0s — too strict for short grind bursts. Lowered to 0.4s.
+  const ONSET=5, OFFSET=15, MIN=5;
   if(cand) { state.eventFrames++; state.silenceFrames=0; if(!state.inEvent&&state.eventFrames>=ONSET){state.inEvent=true;state.eventStart=Date.now();} }
-  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN && dur>=1.0)registerEvent(dur,peakHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
-  const _d=document.getElementById('stat-debug');if(_d)_d.textContent='peak='+peakBrux+' thr='+thresh+(cand?' ✓':'');
+  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN && dur>=0.4)registerEvent(dur,peakBruxHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
+  // Live diagnostic — shows what the algorithm sees RIGHT NOW so user can verify mic + threshold
+  const _d=document.getElementById('stat-debug');
+  if(_d){
+    const ind = state.inEvent ? '🔴 IN EVENT' : (cand ? '⚡ candidate' : (rejReason ? `× ${rejReason}` : '— quiet'));
+    _d.textContent = `bx=${peakBrux} thr=${thresh} snr=${Math.round(snoreBand)} hi=${Math.round(presence)} · ${ind}`;
+  }
   document.getElementById('stat-db').textContent = dB>-80?dB+' dB':'—';
   document.getElementById('stat-freq').textContent = peakHz>50?peakHz+' Hz':'—';
   drawWaveform();
