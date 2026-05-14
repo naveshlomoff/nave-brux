@@ -701,9 +701,13 @@ async function startRecording() {
     state.mediaRecorder = new MediaRecorder(state.mediaStream,{mimeType:mime});
     state.rollingChunks = []; // rolling window: last ~20 s of 1-s slices
     state.chunkTimestamps = [];
+    state.clipInitChunk = null; // ftyp+moov header (iOS MP4 chunk[0]) — must prepend to all trimmed clips
     state.mediaRecorder.ondataavailable = e => {
       if(e.data.size>0){
         const now = Date.now();
+        // Save the very first chunk as the init segment (iOS MP4: ftyp+moov header lives here).
+        // Every trimmed clip must begin with this chunk or iOS reports "operation not supported".
+        if (!state.clipInitChunk) state.clipInitChunk = e.data;
         state.rollingChunks.push(e.data);
         state.chunkTimestamps.push(now);
         // Keep only last 20 seconds worth of chunks
@@ -860,10 +864,12 @@ function analyzeLoop() {
     state.noiseFloor = state.noiseFloor * (1 - alpha) + peakBrux * alpha;
   }
   const nf = state.noiseFloor || 0;
-  // Dynamic threshold = max(absolute thresh, 2.2× noise floor + 4).
+  // Dynamic threshold = max(absolute thresh, 1.8× noise floor + 4).
   // When floor is near 0 (just started): dynThresh = thresh ≈ 25. Ambient 15-20 < 25 → silence OK.
-  // When floor calibrated to ambient (e.g. 20): dynThresh = max(25, 48) = 48 → only grinding triggers.
-  const dynThresh = Math.max(thresh, nf * 2.2 + 4);
+  // When floor calibrated to ambient (e.g. 17): dynThresh = max(25, 34.6) = 34.6
+  //   → bone-conducted grinding (30-40 range) now clears the bar.
+  // Was 2.2× → dynThresh=41.4 at floor=17 → grinding signal (30-40) was below threshold.
+  const dynThresh = Math.max(thresh, nf * 1.8 + 4);
   // Trigger on peak energy in bruxism band ONLY (peakBrux). Removed bruxBand OR condition —
   // bruxBand (average) gets elevated by ambient noise even when there's no event, causing
   // false positives during ambient-noise periods.
@@ -871,8 +877,15 @@ function analyzeLoop() {
   let rejReason = '';
   // FILTER (snore): reject if low-freq strongly dominates (snoring pattern).
   if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
-  // FILTER (speech): reject if high-freq presence strongly dominates (voice pattern).
-  if(state.settings.filterSpeech && presence>midBand*1.4 && presence>50){ cand=false; rejReason='speech'; }
+  // FILTER (speech): two patterns that catch speech but not grinding:
+  //   (a) High-freq presence dominates (sibilants, fricatives): presence > midBand * 1.4
+  //   (b) Bass / voiced fundamental dominates (voiced speech "ניסיון"):
+  //       bass (80-250 Hz) strong relative to bruxism band — grinding is NOT bassy.
+  //       bass > bruxBand * 0.8 catches voiced speech, while grinding keeps bruxBand >> bass.
+  if(state.settings.filterSpeech && (
+    (presence > midBand*1.4 && presence > 50) ||
+    (bass > bruxBand*0.8 && bass > 25)
+  )){ cand=false; rejReason='speech'; }
   // ONSET=3 (~50ms to confirm event start), OFFSET=8 (~130ms silence to close event — faster
   // registration than v4's 250ms so user sees feedback sooner), MIN=3 frames + ≥0.2s duration.
   // Max event duration capped at 8s to prevent one giant event from sustained noise.
@@ -991,7 +1004,20 @@ async function saveEventClip(ev) {
     // context. For testing it avoids capturing whatever the user said 15s earlier.
     const clipStartTime = (ev.id || Date.now()) - ((ev.duration || 0) + 2) * 1000;
     const startIdx = state.chunkTimestamps.findIndex(t => t >= clipStartTime);
-    const chunks = startIdx >= 0 ? state.rollingChunks.slice(startIdx) : [...state.rollingChunks];
+    // Build the chunk array.
+    // If startIdx <= 0 → take everything (init chunk is already chunk[0]).
+    // If startIdx > 0 → trimmed slice starts mid-stream.
+    //   iOS MP4 (fMP4): chunk[0] = ftyp+moov init header; later chunks = moof+mdat.
+    //   Slicing from mid-stream without prepending init header makes the blob undecodable.
+    //   Fix: always prepend state.clipInitChunk when skipping past chunk[0].
+    let chunks;
+    if (startIdx <= 0) {
+      chunks = [...state.rollingChunks];
+    } else if (state.clipInitChunk) {
+      chunks = [state.clipInitChunk, ...state.rollingChunks.slice(startIdx)];
+    } else {
+      chunks = [...state.rollingChunks]; // fallback: take all if init not captured yet
+    }
     if (chunks.length === 0) return;
     const mime = state.clipMime || 'audio/webm';
     const blob = new Blob(chunks, {type: mime});
