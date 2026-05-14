@@ -856,11 +856,31 @@ function analyzeLoop() {
   if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
   // FILTER (speech): reject only if high-freq presence dominates AND is loud.
   if(state.settings.filterSpeech && presence>midBand*1.4 && presence>50){ cand=false; rejReason='speech'; }
-  // ONSET=3 (~50ms), OFFSET=15 (~1s silence to end), MIN=3 frames + ≥0.2s duration
-  // Very permissive — catches short grinding bursts.
-  const ONSET=3, OFFSET=15, MIN=3;
-  if(cand) { state.eventFrames++; state.silenceFrames=0; if(!state.inEvent&&state.eventFrames>=ONSET){state.inEvent=true;state.eventStart=Date.now();} }
-  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN && dur>=0.2)registerEvent(dur,peakBruxHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
+  // ONSET=3 (~50ms), OFFSET=15 (~250ms silence to end), MIN=3 frames + ≥0.2s duration
+  // Max event duration capped at 8s to prevent one giant event from sustained noise.
+  const ONSET=3, OFFSET=15, MIN=3, MAX_DUR_MS=8000;
+  if(cand) {
+    state.eventFrames++; state.silenceFrames=0;
+    if(!state.inEvent && state.eventFrames>=ONSET) { state.inEvent=true; state.eventStart=Date.now(); }
+    // Force-finalize if event has been running for too long (sustained noise / snoring)
+    if(state.inEvent && (Date.now()-state.eventStart) >= MAX_DUR_MS) {
+      const dur=(Date.now()-state.eventStart)/1000;
+      registerEvent(dur,peakBruxHz,bruxBand,dB);
+      state.inEvent=false; state.eventFrames=0; state.silenceFrames=0;
+    }
+  } else {
+    if(state.inEvent) {
+      state.silenceFrames++;
+      if(state.silenceFrames>=OFFSET) {
+        const dur=(Date.now()-state.eventStart)/1000;
+        if(state.eventFrames>=MIN && dur>=0.2) registerEvent(dur,peakBruxHz,bruxBand,dB);
+        state.inEvent=false; state.eventFrames=0;
+      }
+    } else {
+      state.eventFrames=Math.max(0,state.eventFrames-1);
+    }
+    if(!state.inEvent) state.silenceFrames=0;
+  }
   // Live diagnostic — shows what the algorithm sees RIGHT NOW so user can verify mic + threshold
   const _d=document.getElementById('stat-debug');
   if(_d){
