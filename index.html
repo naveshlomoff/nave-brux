@@ -864,12 +864,11 @@ function analyzeLoop() {
     state.noiseFloor = state.noiseFloor * (1 - alpha) + peakBrux * alpha;
   }
   const nf = state.noiseFloor || 0;
-  // Dynamic threshold = max(absolute thresh, 1.8× noise floor + 4).
-  // When floor is near 0 (just started): dynThresh = thresh ≈ 25. Ambient 15-20 < 25 → silence OK.
-  // When floor calibrated to ambient (e.g. 17): dynThresh = max(25, 34.6) = 34.6
-  //   → bone-conducted grinding (30-40 range) now clears the bar.
-  // Was 2.2× → dynThresh=41.4 at floor=17 → grinding signal (30-40) was below threshold.
-  const dynThresh = Math.max(thresh, nf * 1.8 + 4);
+  // Dynamic threshold = max(absolute thresh, 1.6× noise floor + 4).
+  // floor=17 → dynThresh=max(17,31.2)=31.2; grinding at 32-40 clears the bar.
+  // Was 1.8× → dynThresh=34.6; borderline grinding at 32-34 was still missed.
+  // Was 2.2× → dynThresh=41.4; even strong grinding at 38-40 missed.
+  const dynThresh = Math.max(thresh, nf * 1.6 + 4);
   // Trigger on peak energy in bruxism band ONLY (peakBrux). Removed bruxBand OR condition —
   // bruxBand (average) gets elevated by ambient noise even when there's no event, causing
   // false positives during ambient-noise periods.
@@ -877,14 +876,24 @@ function analyzeLoop() {
   let rejReason = '';
   // FILTER (snore): reject if low-freq strongly dominates (snoring pattern).
   if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
-  // FILTER (speech): two patterns that catch speech but not grinding:
-  //   (a) High-freq presence dominates (sibilants, fricatives): presence > midBand * 1.4
-  //   (b) Bass / voiced fundamental dominates (voiced speech "ניסיון"):
-  //       bass (80-250 Hz) strong relative to bruxism band — grinding is NOT bassy.
-  //       bass > bruxBand * 0.8 catches voiced speech, while grinding keeps bruxBand >> bass.
+  // FILTER (speech): two complementary checks that catch speech but NOT grinding.
+  //
+  //   (a) Sibilants / fricatives: high-freq presence dominates over mid (s, sh, f sounds).
+  //       Catches unvoiced consonants. Threshold presence > midBand*1.4 is rarely met by grinding.
+  //
+  //   (b) Voiced speech fundamental: bass (80-250 Hz) ≥ 90% of lowMid (250-800 Hz).
+  //       Voiced speech has strong bass fundamental whose 1st harmonics fall in lowMid
+  //       → bass ≈ lowMid for speech ("ניסיון").
+  //       Grinding is concentrated in lowMid+midBand and creates very little bass
+  //       → bass << lowMid for grinding (ratio ≈ 0.3-0.5, well below 0.9 threshold).
+  //
+  //   NOTE: previous version used bass > bruxBand*0.8 — WRONG. bruxBand = (lowMid+midBand)/2
+  //   which includes lowMid. Grinding raises lowMid, making bruxBand bigger, which made
+  //   bruxBand*0.8 close to bass even for grinding (false positive filter).
+  //   Using lowMid directly gives a clean separation.
   if(state.settings.filterSpeech && (
     (presence > midBand*1.4 && presence > 50) ||
-    (bass > bruxBand*0.8 && bass > 25)
+    (bass > lowMid*0.9 && bass > 25)
   )){ cand=false; rejReason='speech'; }
   // ONSET=3 (~50ms to confirm event start), OFFSET=8 (~130ms silence to close event — faster
   // registration than v4's 250ms so user sees feedback sooner), MIN=3 frames + ≥0.2s duration.
@@ -934,7 +943,9 @@ function analyzeLoop() {
       state._dbgMaxBrux = peakBrux;
       state._dbgMaxTime = Date.now();
     }
-    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> · floor:<b style="color:var(--text2)">${Math.round(nf)}</b> dyn:<b style="color:var(--accent)">${Math.round(dynThresh)}</b><br>snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
+    // ba/lo ratio is the speech filter discriminator: speech→ratio≈1.0+, grinding→ratio≈0.3-0.5
+    const _baLoRatio = lowMid > 0 ? (bass/lowMid).toFixed(2) : '—';
+    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> · floor:<b style="color:var(--text2)">${Math.round(nf)}</b> dyn:<b style="color:var(--accent)">${Math.round(dynThresh)}</b><br>ba:<b>${Math.round(bass)}</b> lo:<b>${Math.round(lowMid)}</b> <span style="color:var(--text3)">ba/lo:${_baLoRatio}</span> · snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
   }
   // Visual level bars
   const dbEl = document.getElementById('level-db');
