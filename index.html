@@ -379,7 +379,23 @@ document.addEventListener('touchstart', function iosUnlock() {
           <div class="stat-card"><div class="stat-val" id="stat-db" style="color:var(--text2)">—</div><div class="stat-lbl">dB level</div></div>
           <div class="stat-card"><div class="stat-val" id="stat-freq" style="color:var(--accent)">—</div><div class="stat-lbl">peak Hz</div></div>
         </div>
-        <div id="stat-debug" style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text3);text-align:center;letter-spacing:0.04em;padding:6px;background:var(--bg2);border-radius:var(--r);border:0.5px dashed var(--border2)">— start recording to see live detection signals —</div>
+        <div style="margin-top:10px">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--text3);letter-spacing:0.06em;text-transform:uppercase;margin-bottom:4px">audio level · bruxism band</div>
+          <div style="display:flex;gap:6px;height:18px;align-items:stretch">
+            <div style="flex:1;background:var(--bg3);border-radius:4px;overflow:hidden;position:relative">
+              <div id="level-db" style="height:100%;background:linear-gradient(90deg,var(--green) 0%,var(--amber) 70%,var(--red) 95%);width:0%;transition:width 0.05s"></div>
+            </div>
+            <div style="flex:1;background:var(--bg3);border-radius:4px;overflow:hidden;position:relative">
+              <div id="level-brux" style="height:100%;background:linear-gradient(90deg,var(--accent) 0%,var(--hot) 100%);width:0%;transition:width 0.05s"></div>
+              <div id="level-brux-thresh" style="position:absolute;top:0;bottom:0;width:2px;background:var(--text);left:25%"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:2px">
+            <div style="flex:1;text-align:center">dB (volume)</div>
+            <div style="flex:1;text-align:center">bruxism band (line = threshold)</div>
+          </div>
+        </div>
+        <div id="stat-debug" style="margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--text);text-align:center;letter-spacing:0.02em;padding:8px;background:var(--bg2);border-radius:var(--r);border:0.5px solid var(--border2);line-height:1.5">— start recording to see live detection signals —</div>
       </div>
 
       <div class="tip-box" style="margin-top:4px">
@@ -842,7 +858,24 @@ function analyzeLoop() {
       state._dbgMaxBrux = peakBrux;
       state._dbgMaxTime = Date.now();
     }
-    _d.innerHTML = `ctx:<b>${ctxState}</b> dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> (5s max:<b>${state._dbgMaxBrux}</b>) thr:<b>${thresh}</b><br>snr:${Math.round(snoreBand)} hi:${Math.round(presence)} · ${ind}`;
+    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> (5s max:<b style="color:var(--accent)">${state._dbgMaxBrux}</b>) thr:<b>${thresh}</b><br>snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
+  }
+  // Visual level bars
+  const dbEl = document.getElementById('level-db');
+  const bxEl = document.getElementById('level-brux');
+  const bxThreshEl = document.getElementById('level-brux-thresh');
+  if (dbEl) {
+    // Map dB from [-90, -10] to [0%, 100%]
+    const dbPct = Math.max(0, Math.min(100, ((dB + 90) / 80) * 100));
+    dbEl.style.width = dbPct + '%';
+  }
+  if (bxEl) {
+    // Map peakBrux from [0, 255] to [0%, 100%]
+    const bxPct = Math.max(0, Math.min(100, (peakBrux / 255) * 100));
+    bxEl.style.width = bxPct + '%';
+  }
+  if (bxThreshEl) {
+    bxThreshEl.style.left = ((thresh / 255) * 100) + '%';
   }
   document.getElementById('stat-db').textContent = dB>-80?dB+' dB':'—';
   document.getElementById('stat-freq').textContent = peakHz>50?peakHz+' Hz':'—';
