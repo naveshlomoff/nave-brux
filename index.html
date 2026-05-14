@@ -671,10 +671,11 @@ async function startRecording() {
   const source = state.audioCtx.createMediaStreamSource(state.mediaStream);
   // GAIN: iOS Safari applies voice-processing that heavily attenuates non-speech sounds
   // (teeth grinding gets gated as "noise"). Captured signal arrives at ~-78 dB instead of
-  // the real ~-40 dB. We pre-amplify 6x BEFORE the analyser to bring the bruxism band
-  // back into a usable detection range.
+  // the real ~-40 dB. Also: voluntary grinding while awake is mostly bone-conducted, so
+  // the mic only catches a small fraction of what the user perceives. We pre-amplify 12x
+  // BEFORE the analyser to bring even faint grinding into a usable detection range.
   const inputGain = state.audioCtx.createGain();
-  inputGain.gain.value = 6;
+  inputGain.gain.value = 12;
   state.analyser = state.audioCtx.createAnalyser();
   state.analyser.fftSize = 2048;
   state.analyser.smoothingTimeConstant = 0.2;
@@ -839,10 +840,12 @@ function analyzeLoop() {
     if(state.freqData[i]>peakBrux){ peakBrux=state.freqData[i]; peakBruxBin=i; }
   }
   const peakBruxHz = Math.round(peakBruxBin*bin); // peak Hz WITHIN the bruxism band
-  // Sensitivity slider 20–95 → threshold 3–35 (very permissive — iOS gates signal)
-  // Combined with 6x input gain, this catches even iOS-attenuated grinding signal.
+  // Sensitivity slider 20–95 → threshold 2–18 (extremely permissive)
+  // With 12x input gain, faint grinding signals (mostly bone-conducted, mostly gated by
+  // iOS voice processing) should clear this. May cause false positives in noisy rooms —
+  // user labels handle that.
   const sens=state.settings.sensitivity;
-  const thresh=Math.round(3+((sens-20)/75)*32);
+  const thresh=Math.round(2+((sens-20)/75)*16);
   let cand=peakBrux>thresh;
   let rejReason = '';
   // FILTER (snore): reject only if low-freq STRONGLY dominates bruxism band.
@@ -850,11 +853,11 @@ function analyzeLoop() {
   if(state.settings.filterSnore && snoreBand>peakBrux*1.5 && snoreBand>40){ cand=false; rejReason='snore'; }
   // FILTER (speech): reject only if high-freq presence dominates AND is loud.
   if(state.settings.filterSpeech && presence>midBand*1.4 && presence>50){ cand=false; rejReason='speech'; }
-  // ONSET=5 (~0.33s) before event starts, OFFSET=15 (~1s) silence to end, MIN=5 frames + ≥0.4s duration
-  // v3 required ≥1.0s — too strict for short grind bursts. Lowered to 0.4s.
-  const ONSET=5, OFFSET=15, MIN=5;
+  // ONSET=3 (~50ms), OFFSET=15 (~1s silence to end), MIN=3 frames + ≥0.2s duration
+  // Very permissive — catches short grinding bursts.
+  const ONSET=3, OFFSET=15, MIN=3;
   if(cand) { state.eventFrames++; state.silenceFrames=0; if(!state.inEvent&&state.eventFrames>=ONSET){state.inEvent=true;state.eventStart=Date.now();} }
-  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN && dur>=0.4)registerEvent(dur,peakBruxHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
+  else { if(state.inEvent){state.silenceFrames++;if(state.silenceFrames>=OFFSET){const dur=(Date.now()-state.eventStart)/1000;if(state.eventFrames>=MIN && dur>=0.2)registerEvent(dur,peakBruxHz,bruxBand,dB);state.inEvent=false;state.eventFrames=0;}}else{state.eventFrames=Math.max(0,state.eventFrames-1);}if(!state.inEvent)state.silenceFrames=0; }
   // Live diagnostic — shows what the algorithm sees RIGHT NOW so user can verify mic + threshold
   const _d=document.getElementById('stat-debug');
   if(_d){
