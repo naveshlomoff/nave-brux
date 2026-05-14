@@ -655,8 +655,17 @@ async function startRecording() {
   const source = state.audioCtx.createMediaStreamSource(state.mediaStream);
   state.analyser = state.audioCtx.createAnalyser();
   state.analyser.fftSize = 2048;
-  state.analyser.smoothingTimeConstant = 0.8;
+  state.analyser.smoothingTimeConstant = 0.2; // was 0.8 — too smoothed for transient detection
+  state.analyser.minDecibels = -90;
+  state.analyser.maxDecibels = -10;
   source.connect(state.analyser);
+  // iOS Safari WORKAROUND: AnalyserNode often returns zeros unless the audio graph
+  // is connected end-to-end. We route through a muted gain to destination so the
+  // graph is "live" without producing audible output.
+  const _muteGain = state.audioCtx.createGain();
+  _muteGain.gain.value = 0;
+  state.analyser.connect(_muteGain);
+  _muteGain.connect(state.audioCtx.destination);
   state.freqData = new Uint8Array(state.analyser.frequencyBinCount);
   state.waveformData = new Float32Array(state.analyser.fftSize);
   // Always run MediaRecorder for event clips (rolling 1-second chunks)
@@ -711,9 +720,14 @@ async function acquireWakeLock() {
 async function releaseWakeLock() {
   if (_wakeLock) { try { await _wakeLock.release(); } catch(e) {} _wakeLock = null; }
 }
-// Re-acquire wake lock when tab returns to foreground
+// Re-acquire wake lock + resume AudioContext when tab returns to foreground
 document.addEventListener('visibilitychange', () => {
-  if (state.recording && document.visibilityState === 'visible' && !_wakeLock) acquireWakeLock();
+  if (state.recording && document.visibilityState === 'visible') {
+    if (!_wakeLock) acquireWakeLock();
+    if (state.audioCtx && state.audioCtx.state === 'suspended') {
+      state.audioCtx.resume().catch(()=>{});
+    }
+  }
 });
 
 // Save current recording state to IndexedDB as a draft. Called periodically + on every event.
@@ -821,7 +835,14 @@ function analyzeLoop() {
   const _d=document.getElementById('stat-debug');
   if(_d){
     const ind = state.inEvent ? '🔴 IN EVENT' : (cand ? '⚡ candidate' : (rejReason ? `× ${rejReason}` : '— quiet'));
-    _d.textContent = `bx=${peakBrux} thr=${thresh} snr=${Math.round(snoreBand)} hi=${Math.round(presence)} · ${ind}`;
+    const ctxState = state.audioCtx?.state || '?';
+    // Track recent max to expose whether mic is responsive at all
+    if (!state._dbgMaxBrux || peakBrux > state._dbgMaxBrux) state._dbgMaxBrux = peakBrux;
+    if (!state._dbgMaxTime || Date.now() - state._dbgMaxTime > 5000) {
+      state._dbgMaxBrux = peakBrux;
+      state._dbgMaxTime = Date.now();
+    }
+    _d.innerHTML = `ctx:<b>${ctxState}</b> dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> (5s max:<b>${state._dbgMaxBrux}</b>) thr:<b>${thresh}</b><br>snr:${Math.round(snoreBand)} hi:${Math.round(presence)} · ${ind}`;
   }
   document.getElementById('stat-db').textContent = dB>-80?dB+' dB':'—';
   document.getElementById('stat-freq').textContent = peakHz>50?peakHz+' Hz':'—';
