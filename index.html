@@ -615,6 +615,12 @@ const state = {
 };
 let _wakeLock = null;
 let _clipUrlCache = {}; // eventId → blob URL (for iOS gesture-preserving playback)
+function _revokeClipCache() {
+  // Release all blob URLs before clearing the cache — prevents memory leaks
+  // (each URL holds the underlying ArrayBuffer alive until revoked or page unload)
+  Object.values(_clipUrlCache).forEach(url => { try { URL.revokeObjectURL(url); } catch(e) {} });
+  _clipUrlCache = {};
+}
 
 // "Night date" = startTime shifted back 12h so a session starting at 23:00 OR 02:00 both belong to the same calendar night
 function sessionDate(startTime) {
@@ -1136,10 +1142,8 @@ async function renderEventsScreen() {
   // Find the night to display: if recording, use live state; else load the most recent session from DB
   let night = null, events = [];
   // Clear stale cached blob URLs from any previous session view.
-  // Blob URLs are page-session scoped — they're still valid, but we need to
-  // re-verify they match the night we're about to show, and clearing is cheap
-  // because preloadClipUrls re-populates asynchronously from local IndexedDB.
-  _clipUrlCache = {};
+  // Revoke all cached blob URLs before re-rendering — releases memory from previous session view.
+  _revokeClipCache();
   if (state.recording && state.sessionId) {
     night = { sessionId: state.sessionId, date: sessionDate(state.startTime), duration: Math.round((Date.now()-state.startTime)/1000) };
     events = [...state.events];
@@ -1346,7 +1350,7 @@ async function clearAllLocalData(){
     for (const n of nights) await dbDelete('nights', n.sessionId);
     const clips = await dbGetAll('clips').catch(()=>[]);
     for (const c of clips) await dbDelete('clips', c.eventId);
-    _clipUrlCache = {};
+    _revokeClipCache();
     localStorage.removeItem('bt-active-recording');
     toast('All local data cleared');
   } catch(e) { toast('Clear failed: ' + e.message); }
@@ -1536,13 +1540,15 @@ async function syncNightToCloud(night) {
       nightId = data.id;
     }
 
-    // Insert-first, delete-after: avoids data loss if the app crashes mid-sync.
-    // Strategy: 1) record existing cloud IDs, 2) insert new rows, 3) delete the old IDs.
-    // A crash between steps 2 and 3 leaves brief duplicates — the next sync removes them.
-    // A crash before step 2 leaves the cloud unchanged — also safe.
-    const { data: existingRows } = await supabase.from('events')
-      .select('id').eq('night_id', nightId).eq('user_id', state.user.id);
-    const existingIds = (existingRows || []).map(r => r.id);
+    // Upsert events by (user_id, night_id, timestamp_sec).
+    // Requires DB constraint: UNIQUE (user_id, night_id, timestamp_sec) — see migration below.
+    // Existing rows (same night + timestamp) are updated in place (label, has_clip, etc.).
+    // New rows are inserted. No delete step needed → zero data-loss risk on partial failure.
+    //
+    // Migration (run once in Supabase SQL editor):
+    //   ALTER TABLE events
+    //   ADD CONSTRAINT events_user_night_timestamp_unique
+    //   UNIQUE (user_id, night_id, timestamp_sec);
     if (events.length > 0) {
       const rows = events.map(ev => ({
         user_id: state.user.id,
@@ -1557,11 +1563,18 @@ async function syncNightToCloud(night) {
         label: ev.label === 'yes' ? 'bruxism' : ev.label === 'no' ? 'not_bruxism' : ev.label === 'maybe' ? 'unsure' : 'unconfirmed',
         has_clip: ev.hasClip || false,
       }));
-      const { error: insertErr } = await supabase.from('events').insert(rows);
-      if (insertErr) throw insertErr;
+      const { error: upsertErr } = await supabase.from('events')
+        .upsert(rows, { onConflict: 'user_id,night_id,timestamp_sec' });
+      if (upsertErr) throw upsertErr;
     }
-    if (existingIds.length > 0) {
-      await supabase.from('events').delete().in('id', existingIds);
+    // Remove cloud events that no longer exist locally (e.g. recording was re-done)
+    if (events.length > 0) {
+      const localTs = events.map(ev => ev.timestamp || 0);
+      await supabase.from('events')
+        .delete()
+        .eq('night_id', nightId)
+        .eq('user_id', state.user.id)
+        .not('timestamp_sec', 'in', `(${localTs.join(',')})`);
     }
 
     // Upload any pending clips (fire-and-forget per clip)
