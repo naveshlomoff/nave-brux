@@ -557,6 +557,9 @@ document.addEventListener('touchstart', function iosUnlock() {
         <button onclick="clearAllLocalData()" style="margin-top:8px;font-family:var(--mono);font-size:10px;padding:8px 14px;border-radius:8px;background:transparent;border:0.5px solid var(--redbd);color:var(--red);cursor:pointer;letter-spacing:0.06em;text-transform:uppercase">
           Clear ALL local data (start fresh)
         </button>
+        <button onclick="loadFromCloud()" style="margin-top:8px;font-family:var(--mono);font-size:10px;padding:8px 14px;border-radius:8px;background:transparent;border:0.5px solid #c4b5fd;color:var(--accent2);cursor:pointer;letter-spacing:0.06em;text-transform:uppercase">
+          Restore from cloud
+        </button>
       </div>
 
       <div style="font-family:var(--mono);font-size:10px;color:var(--text3);text-align:center;padding:16px 0;line-height:2">
@@ -604,7 +607,7 @@ const state = {
   sessionId: null,                 // unique per recording session (Date.now() at start)
   audioCtx: null, analyser: null, mediaStream: null,
   mediaRecorder: null, chunks: [],
-  animFrame: null, timerInterval: null, draftTimer: null,
+  animFrame: null, timerInterval: null, draftTimer: null, cloudSyncTimer: null,
   inEvent: false, eventStart: 0, silenceFrames: 0, eventFrames: 0,
   waveformData: new Float32Array(256), freqData: new Uint8Array(2048),
   settings: { filterSnore:true, filterImpact:true, filterSpeech:true, saveClips:true, sensitivity:45, placement:'pillow', reportTime:'07:00' },
@@ -733,6 +736,23 @@ async function startRecording() {
   await saveDraftNight();
   // Keep draft fresh every 30s (so we know recording is alive AND have recent events persisted)
   state.draftTimer = setInterval(saveDraftNight, 30000);
+  // Cloud sync every 15 min during recording — if phone crashes at 3am, cloud still has recent data
+  state.cloudSyncTimer = setInterval(() => {
+    if (!state.user || !state.sessionId) return;
+    const _now = Date.now();
+    syncNightToCloud({
+      sessionId: state.sessionId,
+      date: sessionDate(state.startTime),
+      startTime: state.startTime,
+      endTime: _now,
+      duration: Math.round((_now - state.startTime) / 1000),
+      events: [...state.events],
+      eventCount: state.events.length,
+      confirmedCount: state.events.filter(e => e.label === 'yes').length,
+      rejectedCount: state.events.filter(e => e.label === 'no').length,
+      draft: true,
+    });
+  }, 15 * 60 * 1000);
   // Wake Lock keeps screen alive → iOS keeps MediaRecorder running
   acquireWakeLock();
   updateRecordUI(true); startTimer(); analyzeLoop();
@@ -791,6 +811,7 @@ async function stopRecording() {
   if(state.animFrame) cancelAnimationFrame(state.animFrame);
   if(state.timerInterval) clearInterval(state.timerInterval);
   if(state.draftTimer) { clearInterval(state.draftTimer); state.draftTimer = null; }
+  if(state.cloudSyncTimer) { clearInterval(state.cloudSyncTimer); state.cloudSyncTimer = null; }
   releaseWakeLock();
   const endTime = Date.now();
   const duration = endTime - state.startTime;
@@ -1297,6 +1318,56 @@ async function clearAllLocalData(){
     toast('All local data cleared');
   } catch(e) { toast('Clear failed: ' + e.message); }
 }
+async function loadFromCloud() {
+  if (!state.user) { toast('Not signed in — cannot restore from cloud'); return; }
+  toast('Restoring from cloud…', 10000);
+  try {
+    const { data: nights, error: nightsErr } = await supabase.from('nights')
+      .select('*').eq('user_id', state.user.id).order('date', { ascending: false });
+    if (nightsErr) throw nightsErr;
+    if (!nights?.length) { toast('No nights found in cloud'); return; }
+    let restored = 0;
+    for (const cn of nights) {
+      if (!cn.session_id) continue;
+      const existing = await dbGet('nights', cn.session_id);
+      if (existing && !existing.draft) continue; // already have a completed local copy
+      const { data: evRows } = await supabase.from('events')
+        .select('*').eq('night_id', cn.id).eq('user_id', state.user.id);
+      // Synthetic local event ID: stable per event, doesn't collide across nights
+      const sessionBase = parseInt(cn.session_id.replace(/-/g, '').slice(0, 12), 16);
+      const events = (evRows || []).map(ev => ({
+        id: sessionBase + (ev.timestamp_sec || 0),
+        timestamp: ev.timestamp_sec || 0,
+        wallTime: ev.wall_time || '',
+        timeLabel: ev.wall_time || '',
+        duration: ev.duration_sec || 0,
+        peakHz: ev.peak_hz || 0,
+        amplitude: ev.amplitude || 0,
+        dB: ev.db_level || 0,
+        bruxismScore: ev.bruxism_score_raw || 0,
+        label: ev.label === 'bruxism' ? 'yes' : ev.label === 'not_bruxism' ? 'no' : ev.label === 'unsure' ? 'maybe' : 'unconfirmed',
+        hasClip: ev.has_clip || false,
+        clipPath: ev.clip_path || null,
+      }));
+      const startMs = cn.created_at ? new Date(cn.created_at).getTime() : Date.now();
+      await dbPut('nights', {
+        sessionId: cn.session_id,
+        date: cn.date || '',
+        startTime: startMs,
+        endTime: startMs + (cn.duration_sec || 0) * 1000,
+        duration: cn.duration_sec || 0,
+        events,
+        eventCount: cn.event_count || events.length,
+        confirmedCount: cn.confirmed_count || 0,
+        rejectedCount: cn.rejected_count || 0,
+        draft: false,
+      });
+      restored++;
+    }
+    toast(`Restored ${restored} night${restored !== 1 ? 's' : ''} from cloud`);
+    renderHistoryScreen();
+  } catch(e) { toast('Restore failed: ' + e.message); }
+}
 function saveSettings(){localStorage.setItem('bruxtrack-settings',JSON.stringify(state.settings));}
 function loadSettings(){try{const s=JSON.parse(localStorage.getItem('bruxtrack-settings')||'{}');Object.assign(state.settings,s);if(state.settings.sensitivity){document.getElementById('sensitivity').value=state.settings.sensitivity;document.getElementById('sens-val').textContent=state.settings.sensitivity;}if(state.settings.reportTime)document.getElementById('report-time').value=state.settings.reportTime;}catch(e){}}
 document.getElementById('sensitivity').addEventListener('change',()=>{state.settings.sensitivity=parseInt(document.getElementById('sensitivity').value);saveSettings();});
@@ -1432,8 +1503,13 @@ async function syncNightToCloud(night) {
       nightId = data.id;
     }
 
-    // Replace events for this session: delete all, then insert fresh
-    await supabase.from('events').delete().eq('night_id', nightId).eq('user_id', state.user.id);
+    // Insert-first, delete-after: avoids data loss if the app crashes mid-sync.
+    // Strategy: 1) record existing cloud IDs, 2) insert new rows, 3) delete the old IDs.
+    // A crash between steps 2 and 3 leaves brief duplicates — the next sync removes them.
+    // A crash before step 2 leaves the cloud unchanged — also safe.
+    const { data: existingRows } = await supabase.from('events')
+      .select('id').eq('night_id', nightId).eq('user_id', state.user.id);
+    const existingIds = (existingRows || []).map(r => r.id);
     if (events.length > 0) {
       const rows = events.map(ev => ({
         user_id: state.user.id,
@@ -1448,8 +1524,11 @@ async function syncNightToCloud(night) {
         label: ev.label === 'yes' ? 'bruxism' : ev.label === 'no' ? 'not_bruxism' : ev.label === 'maybe' ? 'unsure' : 'unconfirmed',
         has_clip: ev.hasClip || false,
       }));
-      const { error } = await supabase.from('events').insert(rows);
-      if (error) throw error;
+      const { error: insertErr } = await supabase.from('events').insert(rows);
+      if (insertErr) throw insertErr;
+    }
+    if (existingIds.length > 0) {
+      await supabase.from('events').delete().in('id', existingIds);
     }
 
     // Upload any pending clips (fire-and-forget per clip)
@@ -1501,7 +1580,8 @@ async function uploadClipToCloud(eventId, sessionId, nightCloudId, retries = 2) 
               .update({ clip_path: path, has_clip: true })
               .eq('night_id', nightCloudId)
               .eq('user_id', state.user.id)
-              .eq('timestamp_sec', ev.timestamp);
+              .eq('timestamp_sec', ev.timestamp)
+              .eq('duration_sec', ev.duration);
             // Also update local event so future syncs skip the upload
             ev.clipPath = path;
           }
