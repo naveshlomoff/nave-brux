@@ -606,7 +606,7 @@ const state = {
   recording: false, startTime: null, events: [],
   sessionId: null,                 // unique per recording session (Date.now() at start)
   audioCtx: null, analyser: null, mediaStream: null,
-  mediaRecorder: null, chunks: [],
+  mediaRecorder: null,
   animFrame: null, timerInterval: null, draftTimer: null, cloudSyncTimer: null,
   inEvent: false, eventStart: 0, silenceFrames: 0, eventFrames: 0,
   waveformData: new Float32Array(256), freqData: new Uint8Array(2048),
@@ -817,7 +817,11 @@ async function stopRecording() {
   const duration = endTime - state.startTime;
   if(state.mediaRecorder && state.mediaRecorder.state!=='inactive') state.mediaRecorder.stop();
   if(state.mediaStream) state.mediaStream.getTracks().forEach(t=>t.stop());
-  if(state.audioCtx) state.audioCtx.close();
+  if(state.audioCtx) { state.audioCtx.close(); state.audioCtx = null; }
+  // Null out media references so a subsequent startRecording() gets a clean slate
+  state.mediaRecorder = null;
+  state.mediaStream = null;
+  state.analyser = null;
   updateRecordUI(false);
   // Wait a beat so any in-flight clip saves finish before we snapshot events
   await new Promise(r => setTimeout(r, 1500));
