@@ -888,10 +888,20 @@ function analyzeLoop() {
   // The user labels it "not_bruxism" in the morning report. Missing grinding = far worse
   // than a few extra events to label. Will revisit with spectral/temporal features in Phase 4.
   if(state.settings.filterSpeech && presence > midBand*1.4 && presence > 50){ cand=false; rejReason='speech'; }
-  // ONSET=3 (~50ms to confirm event start), OFFSET=8 (~130ms silence to close event — faster
-  // registration than v4's 250ms so user sees feedback sooner), MIN=3 frames + ≥0.2s duration.
-  // Max event duration capped at 8s to prevent one giant event from sustained noise.
-  const ONSET=3, OFFSET=8, MIN=3, MAX_DUR_MS=8000;
+  // ONSET=8 (~130ms sustained signal to open event):
+  //   Prevents brief transient sounds (movement in bed, tapping, external noise) from
+  //   registering as events. At 60fps each frame ≈16ms; 8 frames = ~130ms minimum onset.
+  //   Previous ONSET=3 (~50ms) was too easy — a single sharp transient triggered in 3 frames,
+  //   producing 0.2-0.3s false positives that all sounded identical on playback (the "loop").
+  //
+  // OFFSET=12 (~200ms silence to close event):
+  //   Slightly longer window prevents a momentary gap mid-grind from splitting one real event
+  //   into two, which inflated the event count.
+  //
+  // MIN_DUR=1.0s: reject any event shorter than 1 second.
+  //   Real bruxism episodes last 2-10s. 0.2-0.3s events = movement artifacts. Period.
+  //   This single change eliminates the "17 short events that all sound the same" problem.
+  const ONSET=8, OFFSET=12, MIN=8, MAX_DUR_MS=8000;
   if(cand) {
     state.eventFrames++; state.silenceFrames=0;
     if(!state.inEvent && state.eventFrames>=ONSET) { state.inEvent=true; state.eventStart=Date.now(); }
@@ -906,7 +916,7 @@ function analyzeLoop() {
       state.silenceFrames++;
       if(state.silenceFrames>=OFFSET) {
         const dur=(Date.now()-state.eventStart)/1000;
-        if(state.eventFrames>=MIN && dur>=0.2) registerEvent(dur,peakBruxHz,bruxBand,dB);
+        if(state.eventFrames>=MIN && dur>=1.0) registerEvent(dur,peakBruxHz,bruxBand,dB);
         state.inEvent=false; state.eventFrames=0;
       }
     } else {
