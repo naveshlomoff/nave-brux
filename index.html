@@ -888,6 +888,19 @@ function analyzeLoop() {
   // The user labels it "not_bruxism" in the morning report. Missing grinding = far worse
   // than a few extra events to label. Will revisit with spectral/temporal features in Phase 4.
   if(state.settings.filterSpeech && presence > midBand*1.4 && presence > 50){ cand=false; rejReason='speech'; }
+  // FILTER (grace period): suppress all events for the first 5 minutes of recording.
+  //
+  // Why: at recording start the noise floor = 0, so dynThresh collapses to thresh (~17).
+  // Any setup sound — placing phone on nightstand, talking, rolling over — crosses 17
+  // and registers as a candidate. This is setup noise, not sleep bruxism.
+  //
+  // 5 minutes covers: phone placement, talking before sleep, initial settling.
+  // Real bruxism onset requires sleep (~10-30 min); missing the first 5 min is fine.
+  // The noise floor continues calibrating during grace so dynThresh is accurate by the
+  // time detection opens.
+  const GRACE_MS = 5 * 60 * 1000;
+  const _recAge = Date.now() - (state.startTime || Date.now());
+  if(cand && _recAge < GRACE_MS){ cand=false; rejReason='grace'; }
   // ONSET=8 (~130ms sustained signal to open event):
   //   Prevents brief transient sounds (movement in bed, tapping, external noise) from
   //   registering as events. At 60fps each frame ≈16ms; 8 frames = ~130ms minimum onset.
@@ -898,9 +911,10 @@ function analyzeLoop() {
   //   Slightly longer window prevents a momentary gap mid-grind from splitting one real event
   //   into two, which inflated the event count.
   //
-  // MIN_DUR=1.0s: reject any event shorter than 1 second.
-  //   Real bruxism episodes last 2-10s. 0.2-0.3s events = movement artifacts. Period.
-  //   This single change eliminates the "17 short events that all sound the same" problem.
+  // MIN_DUR=2.0s: reject any event shorter than 2 seconds.
+  //   Real bruxism episodes last 2-10s. 1.2-1.4s events (observed overnight) are still
+  //   movement/voice artifacts. Raising from 1.0s → 2.0s eliminates these while keeping
+  //   genuine grinding (which is always sustained).
   const ONSET=8, OFFSET=12, MIN=8, MAX_DUR_MS=8000;
   if(cand) {
     state.eventFrames++; state.silenceFrames=0;
@@ -916,7 +930,7 @@ function analyzeLoop() {
       state.silenceFrames++;
       if(state.silenceFrames>=OFFSET) {
         const dur=(Date.now()-state.eventStart)/1000;
-        if(state.eventFrames>=MIN && dur>=1.0) registerEvent(dur,peakBruxHz,bruxBand,dB);
+        if(state.eventFrames>=MIN && dur>=2.0) registerEvent(dur,peakBruxHz,bruxBand,dB);
         state.inEvent=false; state.eventFrames=0;
       }
     } else {
@@ -950,7 +964,12 @@ function analyzeLoop() {
     // gap = how far peakBrux is above noise floor — positive = detected, negative = below threshold
     const _gap = peakBrux - Math.round(nf);
     const _gapColor = _gap > 0 ? 'var(--green)' : 'var(--red)';
-    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> · floor:<b style="color:var(--text2)">${Math.round(nf)}</b> dyn:<b style="color:var(--accent)">${Math.round(dynThresh)}</b> <span style="color:${_gapColor}">gap:${_gap>0?'+':''}${_gap}</span><br>ba:<b>${Math.round(bass)}</b> lo:<b>${Math.round(lowMid)}</b> <span style="color:var(--text3)">ba/lo:${_baLoRatio}</span> · snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
+    // Grace period countdown so user can see calibration phase in real time
+    const _graceLeft = Math.max(0, Math.ceil((GRACE_MS - _recAge) / 1000));
+    const _graceSuffix = _graceLeft > 0
+      ? ` · <span style="color:var(--text3)">🛡 calibrating ${_graceLeft}s</span>`
+      : '';
+    _d.innerHTML = `ctx:<b>${ctxState}</b> · dB:<b>${dB}</b> · bx:<b>${peakBrux}</b> avg:<b>${Math.round(bruxBand)}</b> · floor:<b style="color:var(--text2)">${Math.round(nf)}</b> dyn:<b style="color:var(--accent)">${Math.round(dynThresh)}</b> <span style="color:${_gapColor}">gap:${_gap>0?'+':''}${_gap}</span>${_graceSuffix}<br>ba:<b>${Math.round(bass)}</b> lo:<b>${Math.round(lowMid)}</b> <span style="color:var(--text3)">ba/lo:${_baLoRatio}</span> · snr:${Math.round(snoreBand)} · hi:${Math.round(presence)} · <b>${ind}</b>`;
   }
   // Visual level bars
   const dbEl = document.getElementById('level-db');
