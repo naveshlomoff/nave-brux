@@ -860,6 +860,9 @@ function analyzeLoop() {
   const bandE = (lo,hi) => { const l=Math.floor(lo/bin),h=Math.ceil(hi/bin); let s=0; for(let i=l;i<=h&&i<state.freqData.length;i++) s+=state.freqData[i]; return s/Math.max(1,h-l); };
   const subBass=bandE(20,80), bass=bandE(80,250), lowMid=bandE(250,800), midBand=bandE(800,3500), presence=bandE(3500,6000), air=bandE(6000,8000);
   const bruxBand=(lowMid+midBand)/2, snoreBand=(subBass+bass)/2;
+  // Aₚ input for BSI (Phase 2): unified 250–3500 Hz average — single pass, no weighted bias.
+  // bruxBand above is kept for detection/snore logic. bruxBandFull is what gets stored per event.
+  const bruxBandFull = bandE(250, 3500);
   let peakBin=0; for(let i=1;i<state.freqData.length;i++) if(state.freqData[i]>state.freqData[peakBin]) peakBin=i;
   const peakHz = Math.round(peakBin*bin);
   let rms=0; for(let i=0;i<state.waveformData.length;i++) rms+=state.waveformData[i]**2;
@@ -953,7 +956,7 @@ function analyzeLoop() {
     // Force-finalize if event has been running for too long (sustained noise / snoring)
     if(state.inEvent && (Date.now()-state.eventStart) >= MAX_DUR_MS) {
       const dur=(Date.now()-state.eventStart)/1000;
-      registerEvent(dur,peakBruxHz,bruxBand,dB);
+      registerEvent(dur,peakBruxHz,bruxBandFull,dB);
       state.inEvent=false; state.eventFrames=0; state.silenceFrames=0;
     }
   } else {
@@ -961,7 +964,7 @@ function analyzeLoop() {
       state.silenceFrames++;
       if(state.silenceFrames>=OFFSET) {
         const dur=(Date.now()-state.eventStart)/1000;
-        if(state.eventFrames>=MIN && dur>=2.0) registerEvent(dur,peakBruxHz,bruxBand,dB);
+        if(state.eventFrames>=MIN && dur>=2.0) registerEvent(dur,peakBruxHz,bruxBandFull,dB);
         state.inEvent=false; state.eventFrames=0;
       }
     } else {
